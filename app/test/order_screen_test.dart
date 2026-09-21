@@ -10,7 +10,7 @@ void main() {
   testWidgets('create order then a new screen still shows it', (tester) async {
     var pending = false;
     final client = MockClient((request) async {
-      if (request.method == 'POST') {
+      if (request.method == 'POST' && request.url.path.endsWith('/order')) {
         pending = true;
       }
       return http.Response(
@@ -19,11 +19,21 @@ void main() {
               ? {
                   'state': 'Pending',
                   'amount': '1',
+                  'payment_hash': null,
+                  'invoice_address': null,
+                  'invoice_status': null,
                   'log': [
                     {'at': 't', 'text': 'created order for 1 CKB'},
                   ],
                 }
-              : {'state': 'Idle', 'amount': null, 'log': []},
+              : {
+                  'state': 'Idle',
+                  'amount': null,
+                  'payment_hash': null,
+                  'invoice_address': null,
+                  'invoice_status': null,
+                  'log': [],
+                },
         ),
         200,
       );
@@ -43,6 +53,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Pending'), findsOneWidget);
     expect(find.textContaining('created order for 1 CKB'), findsOneWidget);
+    expect(find.byKey(const Key('create-hold')), findsOneWidget);
 
     await tester.pumpWidget(TwineApp(client: client));
     await tester.pumpAndSettle();

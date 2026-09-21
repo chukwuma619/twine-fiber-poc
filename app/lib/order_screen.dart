@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -24,6 +26,8 @@ String defaultDaemonUrl() {
   return 'http://127.0.0.1:8080';
 }
 
+const Duration _fiatWindow = Duration(minutes: 3);
+
 class OrderScreen extends StatefulWidget {
   const OrderScreen({super.key, this.client, this.initialUrl});
 
@@ -45,7 +49,9 @@ class _OrderScreenState extends State<OrderScreen> {
   OrderSnapshot? _order;
   String? _error;
   bool _loading = true;
-  bool _saving = false;
+  bool _busy = false;
+  DateTime? _fiatDeadline;
+  Timer? _fiatTicker;
 
   @override
   void initState() {
@@ -55,6 +61,7 @@ class _OrderScreenState extends State<OrderScreen> {
 
   @override
   void dispose() {
+    _fiatTicker?.cancel();
     _url.dispose();
     _amount.dispose();
     super.dispose();
@@ -73,6 +80,12 @@ class _OrderScreenState extends State<OrderScreen> {
       setState(() {
         _order = order;
         _loading = false;
+        if (order.isWaitingFiat && _fiatDeadline == null) {
+          _startFiatTimer();
+        }
+        if (!order.isWaitingFiat) {
+          _clearFiatTimer();
+        }
       });
     } catch (err) {
       if (!mounted) {
@@ -85,19 +98,24 @@ class _OrderScreenState extends State<OrderScreen> {
     }
   }
 
-  Future<void> _create() async {
+  Future<void> _run(Future<OrderSnapshot> Function() action) async {
     setState(() {
-      _saving = true;
+      _busy = true;
       _error = null;
     });
     try {
-      final order = await _api.createOrder(_url.text, _amount.text);
+      final order = await action();
       if (!mounted) {
         return;
       }
       setState(() {
         _order = order;
-        _saving = false;
+        _busy = false;
+        if (order.isWaitingFiat) {
+          _startFiatTimer();
+        } else {
+          _clearFiatTimer();
+        }
       });
     } catch (err) {
       if (!mounted) {
@@ -105,17 +123,51 @@ class _OrderScreenState extends State<OrderScreen> {
       }
       setState(() {
         _error = err.toString();
-        _saving = false;
+        _busy = false;
       });
     }
   }
 
+  void _startFiatTimer() {
+    _fiatDeadline ??= DateTime.now().add(_fiatWindow);
+    _fiatTicker?.cancel();
+    _fiatTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {});
+    });
+  }
+
+  void _clearFiatTimer() {
+    _fiatTicker?.cancel();
+    _fiatTicker = null;
+    _fiatDeadline = null;
+  }
+
+  String? get _fiatRemaining {
+    final deadline = _fiatDeadline;
+    if (deadline == null || !(_order?.isWaitingFiat ?? false)) {
+      return null;
+    }
+    final left = deadline.difference(DateTime.now());
+    if (left.isNegative) {
+      return '0:00';
+    }
+    final minutes = left.inMinutes;
+    final seconds = left.inSeconds % 60;
+    return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final pending = _order?.isPending ?? false;
+    final order = _order;
+    final open = order?.isOpen ?? false;
     final canCreate =
-        !_loading && !_saving && !pending && _amount.text.trim().isNotEmpty;
-    final stateLabel = _loading ? 'Loading' : (_order?.state ?? 'Idle');
+        !_loading && !_busy && !open && _amount.text.trim().isNotEmpty;
+    final stateLabel = _loading ? 'Loading' : (order?.state ?? 'Idle');
+    final seller = _role == Role.seller;
+    final buyer = _role == Role.buyer;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Twine')),
@@ -157,12 +209,107 @@ class _OrderScreenState extends State<OrderScreen> {
           const SizedBox(height: 12),
           FilledButton(
             key: const Key('create-order'),
-            onPressed: canCreate ? _create : null,
-            child: Text(_saving ? 'Creating...' : 'Create order'),
+            onPressed: canCreate
+                ? () => _run(() => _api.createOrder(_url.text, _amount.text))
+                : null,
+            child: Text(_busy ? 'Working...' : 'Create order'),
           ),
+          if (order?.isPending ?? false) ...[
+            const SizedBox(height: 8),
+            OutlinedButton(
+              key: const Key('demo-cancel'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.demoCancel(_url.text)),
+              child: const Text('Demo cancel unpaid invoice'),
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('create-hold'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.createHold(_url.text)),
+              child: const Text('Create hold invoice'),
+            ),
+          ],
+          if (seller && (order?.isWaitingHold ?? false)) ...[
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('lock'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.lock(_url.text)),
+              child: const Text('Lock'),
+            ),
+          ],
+          if (seller &&
+              (order?.isHeld == true ||
+                  order?.isWaitingFiat == true ||
+                  order?.isFiatSent == true ||
+                  order?.isReleasing == true)) ...[
+            const SizedBox(height: 8),
+            OutlinedButton(
+              key: const Key('try-cancel'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.tryCancel(_url.text)),
+              child: const Text('Try cancel (skipped after Received)'),
+            ),
+          ],
+          if (buyer && (order?.isHeld ?? false)) ...[
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('accept'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.accept(_url.text)),
+              child: const Text('Accept'),
+            ),
+          ],
+          if (buyer && (order?.isWaitingFiat ?? false)) ...[
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('fiat-sent'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.fiatSent(_url.text)),
+              child: const Text('Fiat sent'),
+            ),
+          ],
+          if (seller &&
+              ((order?.isFiatSent ?? false) ||
+                  (order?.isReleasing ?? false))) ...[
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('release'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.release(_url.text)),
+              child: Text(
+                (order?.isReleasing ?? false)
+                    ? 'Release (continue path A)'
+                    : 'Release',
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           Text(stateLabel, key: const Key('order-state')),
-          if (_order?.amount != null) Text('Amount: ${_order!.amount} CKB'),
+          if (order?.amount != null) Text('Amount: ${order!.amount} CKB'),
+          if (order?.invoiceStatus != null)
+            Text('Invoice: ${order!.invoiceStatus}'),
+          if (order?.paymentHash != null) Text('H: ${order!.paymentHash}'),
+          if (order?.invoiceAddress != null) ...[
+            const SizedBox(height: 4),
+            SelectableText(
+              'Invoice address:\n${order!.invoiceAddress}',
+              key: const Key('invoice-address'),
+            ),
+          ],
+          if (_fiatRemaining != null)
+            Text(
+              'Fiat window: $_fiatRemaining',
+              key: const Key('fiat-timer'),
+            ),
           if (_error != null) ...[
             const SizedBox(height: 8),
             Text(_error!),
@@ -170,11 +317,17 @@ class _OrderScreenState extends State<OrderScreen> {
           const SizedBox(height: 16),
           const Text('Log'),
           const SizedBox(height: 8),
-          if (_order == null || _order!.log.isEmpty)
+          if (order == null || order.log.isEmpty)
             const Text('No log lines yet.')
           else
-            for (final line in _order!.log)
-              Text('${line.at}  ${line.text}', key: const Key('order-log')),
+            for (final line in order.log)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(
+                  '${line.at}  ${line.text}',
+                  key: const Key('order-log'),
+                ),
+              ),
         ],
       ),
     );

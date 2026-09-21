@@ -7,12 +7,12 @@ use std::process::ExitCode;
 
 use axum::extract::State;
 use axum::http::{HeaderValue, Method, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use health::{health_report, Config, Health};
-use order::{CreateError, CreateOrderBody, Order, OrderStore};
+use order::{CreateOrderBody, OrderError, OrderStore, OrderView};
 use rpc::FiberRpc;
 
 #[derive(Clone)]
@@ -42,6 +42,13 @@ async fn main() -> ExitCode {
     let app = Router::new()
         .route("/health", get(health))
         .route("/order", get(get_order).post(create_order))
+        .route("/order/demo_cancel", post(demo_cancel))
+        .route("/order/hold", post(create_hold))
+        .route("/order/lock", post(lock_payment))
+        .route("/order/try_cancel", post(try_cancel))
+        .route("/order/accept", post(accept))
+        .route("/order/fiat_sent", post(fiat_sent))
+        .route("/order/release", post(release))
         .layer(local_cors())
         .with_state(App {
             config,
@@ -67,39 +74,90 @@ async fn health(State(app): State<App>) -> Json<Health> {
     Json(health_report(&app.rpc, &app.config).await)
 }
 
-async fn get_order(State(app): State<App>) -> Json<Order> {
+async fn get_order(State(app): State<App>) -> Json<OrderView> {
     Json(app.orders.snapshot())
 }
 
 async fn create_order(
     State(app): State<App>,
     Json(body): Json<CreateOrderBody>,
-) -> Result<Json<Order>, ApiError> {
+) -> Result<Json<OrderView>, ApiError> {
     app.orders
         .create(&body.amount)
         .map(Json)
         .map_err(ApiError::from)
 }
 
-enum ApiError {
-    Create(CreateError),
+async fn demo_cancel(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .demo_cancel(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
 }
 
-impl From<CreateError> for ApiError {
-    fn from(err: CreateError) -> Self {
-        Self::Create(err)
+async fn create_hold(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .create_hold(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn lock_payment(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .lock_payment(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn try_cancel(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .try_cancel(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn accept(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders.accept().map(Json).map_err(ApiError::from)
+}
+
+async fn fiat_sent(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders.fiat_sent().map(Json).map_err(ApiError::from)
+}
+
+async fn release(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .release(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+enum ApiError {
+    Order(OrderError),
+}
+
+impl From<OrderError> for ApiError {
+    fn from(err: OrderError) -> Self {
+        Self::Order(err)
     }
 }
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let ApiError::Create(err) = self;
+        let ApiError::Order(err) = self;
         let (status, message) = match err {
-            CreateError::BadAmount(message) => (StatusCode::BAD_REQUEST, message),
-            CreateError::AlreadyOpen => {
+            OrderError::BadAmount(message) | OrderError::BadState(message) => {
+                (StatusCode::BAD_REQUEST, message)
+            }
+            OrderError::AlreadyOpen => {
                 (StatusCode::CONFLICT, "an order is already open".to_string())
             }
-            CreateError::Save(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+            OrderError::Fiber(message) => (StatusCode::BAD_GATEWAY, message),
+            OrderError::Save(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

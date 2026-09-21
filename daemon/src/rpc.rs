@@ -8,7 +8,7 @@ pub struct FiberRpc {
 impl FiberRpc {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("reqwest client");
         Self { http }

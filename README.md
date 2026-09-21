@@ -51,6 +51,57 @@ The screen has an amount field, Create order, a Seller / Buyer / Solver switch, 
 
 On the iOS simulator the daemon URL is `http://127.0.0.1:8080`. On the Android emulator use `http://10.0.2.2:8080`. The app fills that in. A phone on the same network needs `LISTEN=0.0.0.0:8080` and the Mac's LAN address.
 
+## Stage 2
+
+Seller’s testnet CKB is held in a Fiber hold invoice. Preimage `S` is generated in the daemon; `H = SHA256(S)`. The Twine node gets `new_invoice` with `payment_hash` and `hash_algorithm: sha256` (no `payment_preimage`). `S` never leaves the daemon.
+
+Restart only the daemon after code changes (leave the three `fnn` processes alone):
+
+```bash
+# if an old daemon is still bound to :8080
+kill "$(cat nodes/daemon.pid)" 2>/dev/null || true
+# or: lsof -tiTCP:8080 -sTCP:LISTEN | xargs kill
+
+cd daemon && cargo build && ./target/debug/twine-daemon
+# log: nodes/daemon.log when started via nohup; ORDER_FILE defaults to daemon/order.json
+```
+
+App on the iPhone simulator (the device that worked for stage 1):
+
+```bash
+cd app && flutter run -d 242B4280-AADB-418E-A0E9-F3C400EA7D57
+```
+
+Buttons by role:
+
+| Role | Actions |
+| --- | --- |
+| Any | Create order → Demo cancel unpaid invoice → Create hold invoice |
+| Seller | Lock → Try cancel (skipped after Received) → Release |
+| Buyer | Accept (starts a 3 minute fiat timer) → Fiat sent |
+
+HTTP shape (daemon only talks to `fnn`):
+
+```bash
+curl -s http://127.0.0.1:8080/order
+curl -s -X POST http://127.0.0.1:8080/order/demo_cancel -H 'content-type: application/json' -d '{}'
+curl -s -X POST http://127.0.0.1:8080/order/hold -H 'content-type: application/json' -d '{}'
+curl -s -X POST http://127.0.0.1:8080/order/lock -H 'content-type: application/json' -d '{}'
+# confirm hold (replace H):
+curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"get_invoice","params":[{"payment_hash":"H"}]}'
+curl -s -X POST http://127.0.0.1:8080/order/try_cancel -H 'content-type: application/json' -d '{}'
+curl -s -X POST http://127.0.0.1:8080/order/accept -H 'content-type: application/json' -d '{}'
+curl -s -X POST http://127.0.0.1:8080/order/fiat_sent -H 'content-type: application/json' -d '{}'
+curl -s -X POST http://127.0.0.1:8080/order/release -H 'content-type: application/json' -d '{}'
+```
+
+Acceptance for this stage: `get_invoice` is `Received`, seller `get_payment` stays `Inflight`, Twine’s spendable outbound balance (Twine → buyer) has not gained the trade amount, and the app / order log shows `H=…` with `S sealed in daemon`. Stage 2 `Release` sets state `Releasing` and does **not** call `settle_invoice`.
+
+`POST /order/demo_cancel` creates a throwaway unpaid invoice and cancels it so the live order can stay lockable. After `Received`, `POST /order/try_cancel` refuses to call `cancel_invoice` on the live hold (calling it can destroy the trade); the log says refund is TLC expiry.
+
+Relaunch the app: `GET /order` still returns `Held` or later (`WaitingFiat` / `FiatSent` / `Releasing`).
+
 ## What a reviewer can do
 
 1. Create a sell order for a small amount of testnet CKB.
