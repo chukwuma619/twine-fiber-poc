@@ -16,6 +16,22 @@ class OrderLogLine {
   }
 }
 
+class ChatLine {
+  const ChatLine({required this.at, required this.from, required this.text});
+
+  final String at;
+  final String from;
+  final String text;
+
+  factory ChatLine.fromJson(Map<String, dynamic> json) {
+    return ChatLine(
+      at: json['at'] as String? ?? '',
+      from: json['from'] as String? ?? '',
+      text: json['text'] as String? ?? '',
+    );
+  }
+}
+
 class OrderSnapshot {
   const OrderSnapshot({
     required this.state,
@@ -24,6 +40,7 @@ class OrderSnapshot {
     required this.invoiceAddress,
     required this.invoiceStatus,
     required this.log,
+    required this.chat,
   });
 
   final String state;
@@ -32,6 +49,7 @@ class OrderSnapshot {
   final String? invoiceAddress;
   final String? invoiceStatus;
   final List<OrderLogLine> log;
+  final List<ChatLine> chat;
 
   bool get isIdle => state == 'Idle';
   bool get isPending => state == 'Pending';
@@ -40,13 +58,40 @@ class OrderSnapshot {
   bool get isWaitingFiat => state == 'WaitingFiat';
   bool get isFiatSent => state == 'FiatSent';
   bool get isReleasing => state == 'Releasing';
+  bool get isLeg2Failed => state == 'Leg2Failed';
+  bool get isDisputed => state == 'Disputed';
   bool get isSettled => state == 'Settled';
+  bool get isExpired => state == 'Expired';
   bool get isOpen =>
       !isIdle &&
       state != 'Cancelled' &&
       state != 'Paid' &&
       state != 'Settled' &&
       state != 'Expired';
+
+  bool get canOpenDispute =>
+      isWaitingFiat || isFiatSent || isLeg2Failed;
+
+  bool get sellerWinsLogged =>
+      log.any((line) => line.text.contains('solver awarded seller'));
+
+  bool get pathDExpiredLogged =>
+      log.any((line) => line.text.contains('path D: hold invoice Expired'));
+
+  /// Open hold that may still transition to Expired via TLC (Path D).
+  bool get watchesHoldExpiry {
+    switch (state) {
+      case 'Held':
+      case 'WaitingFiat':
+      case 'FiatSent':
+      case 'Leg2Failed':
+      case 'Disputed':
+      case 'Releasing':
+        return true;
+      default:
+        return false;
+    }
+  }
 
   factory OrderSnapshot.fromJson(Map<String, dynamic> json) {
     final rawLog = json['log'];
@@ -58,6 +103,15 @@ class OrderSnapshot {
         }
       }
     }
+    final rawChat = json['chat'];
+    final chat = <ChatLine>[];
+    if (rawChat is List) {
+      for (final line in rawChat) {
+        if (line is Map<String, dynamic>) {
+          chat.add(ChatLine.fromJson(line));
+        }
+      }
+    }
     return OrderSnapshot(
       state: json['state'] as String? ?? 'Idle',
       amount: json['amount'] as String?,
@@ -65,6 +119,7 @@ class OrderSnapshot {
       invoiceAddress: json['invoice_address'] as String?,
       invoiceStatus: json['invoice_status'] as String?,
       log: log,
+      chat: chat,
     );
   }
 }
@@ -118,6 +173,30 @@ class DaemonApi {
 
   Future<OrderSnapshot> release(String baseUrl) async {
     return _post(baseUrl, '/order/release');
+  }
+
+  Future<OrderSnapshot> retry(String baseUrl) async {
+    return _post(baseUrl, '/order/retry');
+  }
+
+  Future<OrderSnapshot> openDispute(String baseUrl) async {
+    return _post(baseUrl, '/order/dispute');
+  }
+
+  Future<OrderSnapshot> postChat(
+    String baseUrl, {
+    required String from,
+    required String text,
+  }) async {
+    return _post(baseUrl, '/order/chat', body: {'from': from, 'text': text});
+  }
+
+  Future<OrderSnapshot> awardBuyer(String baseUrl) async {
+    return _post(baseUrl, '/order/award_buyer');
+  }
+
+  Future<OrderSnapshot> awardSeller(String baseUrl) async {
+    return _post(baseUrl, '/order/award_seller');
   }
 
   Future<OrderSnapshot> _post(

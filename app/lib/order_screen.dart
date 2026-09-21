@@ -19,6 +19,17 @@ String roleLabel(Role role) {
   }
 }
 
+String chatFromForRole(Role role) {
+  switch (role) {
+    case Role.seller:
+      return 'seller';
+    case Role.buyer:
+      return 'buyer';
+    case Role.solver:
+      return 'solver';
+  }
+}
+
 String defaultDaemonUrl() {
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     return 'http://10.0.2.2:8080';
@@ -27,6 +38,7 @@ String defaultDaemonUrl() {
 }
 
 const Duration _fiatWindow = Duration(minutes: 3);
+const Duration _orderPollInterval = Duration(seconds: 5);
 
 class OrderScreen extends StatefulWidget {
   const OrderScreen({super.key, this.client, this.initialUrl});
@@ -44,6 +56,7 @@ class _OrderScreenState extends State<OrderScreen> {
     text: widget.initialUrl ?? defaultDaemonUrl(),
   );
   final TextEditingController _amount = TextEditingController();
+  final TextEditingController _chat = TextEditingController();
 
   Role _role = Role.seller;
   OrderSnapshot? _order;
@@ -52,6 +65,7 @@ class _OrderScreenState extends State<OrderScreen> {
   bool _busy = false;
   DateTime? _fiatDeadline;
   Timer? _fiatTicker;
+  Timer? _orderPoll;
 
   @override
   void initState() {
@@ -62,8 +76,10 @@ class _OrderScreenState extends State<OrderScreen> {
   @override
   void dispose() {
     _fiatTicker?.cancel();
+    _orderPoll?.cancel();
     _url.dispose();
     _amount.dispose();
+    _chat.dispose();
     super.dispose();
   }
 
@@ -87,6 +103,7 @@ class _OrderScreenState extends State<OrderScreen> {
           _clearFiatTimer();
         }
       });
+      _syncOrderPoll(order);
     } catch (err) {
       if (!mounted) {
         return;
@@ -95,6 +112,44 @@ class _OrderScreenState extends State<OrderScreen> {
         _error = err.toString();
         _loading = false;
       });
+      _syncOrderPoll(null);
+    }
+  }
+
+  /// Background refresh for Path D / live status. Does not flip the Loading label.
+  Future<void> _pollOrder() async {
+    if (_busy || _loading) {
+      return;
+    }
+    try {
+      final order = await _api.fetchOrder(_url.text);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _order = order;
+        if (order.isWaitingFiat && _fiatDeadline == null) {
+          _startFiatTimer();
+        }
+        if (!order.isWaitingFiat) {
+          _clearFiatTimer();
+        }
+      });
+      _syncOrderPoll(order);
+    } catch (_) {
+      // Keep showing the last good snapshot; next tick retries.
+    }
+  }
+
+  void _syncOrderPoll(OrderSnapshot? order) {
+    final shouldPoll = order?.watchesHoldExpiry ?? false;
+    if (shouldPoll) {
+      _orderPoll ??= Timer.periodic(_orderPollInterval, (_) {
+        _pollOrder();
+      });
+    } else {
+      _orderPoll?.cancel();
+      _orderPoll = null;
     }
   }
 
@@ -117,6 +172,7 @@ class _OrderScreenState extends State<OrderScreen> {
           _clearFiatTimer();
         }
       });
+      _syncOrderPoll(order);
     } catch (err) {
       if (!mounted) {
         return;
@@ -168,6 +224,10 @@ class _OrderScreenState extends State<OrderScreen> {
     final stateLabel = _loading ? 'Loading' : (order?.state ?? 'Idle');
     final seller = _role == Role.seller;
     final buyer = _role == Role.buyer;
+    final solver = _role == Role.solver;
+    final canChat =
+        (buyer || seller) && (order?.isDisputed ?? false) && !_busy;
+    final chatReady = canChat && _chat.text.trim().isNotEmpty;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Twine')),
@@ -292,6 +352,114 @@ class _OrderScreenState extends State<OrderScreen> {
               ),
             ),
           ],
+          if (order?.isLeg2Failed ?? false) ...[
+            const SizedBox(height: 12),
+            const Text(
+              'Path B: payment to the buyer failed. Submit a new invoice to retry. '
+              'If the buyer never returns, the seller is refunded when the TLC expires. '
+              'Do not cancel the held invoice.',
+              key: Key('leg2-failed-message'),
+            ),
+            if (buyer || seller) ...[
+              const SizedBox(height: 8),
+              FilledButton(
+                key: const Key('retry'),
+                onPressed: _busy
+                    ? null
+                    : () => _run(() => _api.retry(_url.text)),
+                child: const Text('Retry with new invoice'),
+              ),
+            ],
+          ],
+          if ((buyer || seller) && (order?.canOpenDispute ?? false)) ...[
+            const SizedBox(height: 8),
+            OutlinedButton(
+              key: const Key('open-dispute'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(() => _api.openDispute(_url.text)),
+              child: const Text('Open dispute'),
+            ),
+          ],
+          if (order?.isDisputed ?? false) ...[
+            const SizedBox(height: 12),
+            const Text('Dispute chat', key: Key('dispute-chat-heading')),
+            if (order!.chat.isEmpty)
+              const Text('No chat lines yet.', key: Key('chat-empty'))
+            else
+              for (final line in order.chat)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Text(
+                    '${line.at}  ${line.from}: ${line.text}',
+                    key: const Key('chat-line'),
+                  ),
+                ),
+            if (buyer || seller) ...[
+              const SizedBox(height: 8),
+              TextField(
+                key: const Key('chat-input'),
+                controller: _chat,
+                decoration: const InputDecoration(labelText: 'Chat line'),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 8),
+              FilledButton(
+                key: const Key('post-chat'),
+                onPressed: chatReady
+                    ? () {
+                        final text = _chat.text;
+                        _chat.clear();
+                        _run(
+                          () => _api.postChat(
+                            _url.text,
+                            from: chatFromForRole(_role),
+                            text: text,
+                          ),
+                        );
+                      }
+                    : null,
+                child: const Text('Post chat line'),
+              ),
+            ],
+            if (solver) ...[
+              const SizedBox(height: 8),
+              FilledButton(
+                key: const Key('award-buyer'),
+                onPressed: _busy
+                    ? null
+                    : () => _run(() => _api.awardBuyer(_url.text)),
+                child: const Text('Award buyer'),
+              ),
+              const SizedBox(height: 8),
+              FilledButton(
+                key: const Key('award-seller'),
+                onPressed: _busy
+                    ? null
+                    : () => _run(() => _api.awardSeller(_url.text)),
+                child: const Text('Award seller'),
+              ),
+            ],
+            if (order.sellerWinsLogged)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Seller wins: hold stays Received. Seller is refunded when the TLC expires. '
+                  'No settle_invoice and no cancel_invoice.',
+                  key: Key('seller-wins-message'),
+                ),
+              ),
+          ],
+          if (order?.isExpired ?? false) ...[
+            const SizedBox(height: 12),
+            Text(
+              order!.pathDExpiredLogged
+                  ? 'Path D: hold Expired. Seller payment failed back; seller refunded because the TLC expired. '
+                      'settle_invoice fails; cancel_invoice was not called.'
+                  : 'Path D: hold Expired. Seller is refunded because the TLC expired.',
+              key: const Key('path-d-expired-message'),
+            ),
+          ],
           const SizedBox(height: 16),
           Text(stateLabel, key: const Key('order-state')),
           if (order?.amount != null) Text('Amount: ${order!.amount} CKB'),
@@ -312,7 +480,7 @@ class _OrderScreenState extends State<OrderScreen> {
             ),
           if (_error != null) ...[
             const SizedBox(height: 8),
-            Text(_error!),
+            Text(_error!, key: const Key('error-message')),
           ],
           const SizedBox(height: 16),
           const Text('Log'),

@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use health::{health_report, Config, Health};
-use order::{CreateOrderBody, OrderError, OrderStore, OrderView};
+use order::{CreateOrderBody, OrderError, OrderStore, OrderView, PostChatBody, HOLD_EXPIRY_POLL};
 use rpc::FiberRpc;
 
 #[derive(Clone)]
@@ -39,6 +39,12 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let app_state = App {
+        config: config.clone(),
+        rpc: FiberRpc::new(),
+        orders: orders.clone(),
+    };
+    tokio::spawn(hold_expiry_poller(app_state.clone()));
     let app = Router::new()
         .route("/health", get(health))
         .route("/order", get(get_order).post(create_order))
@@ -49,12 +55,13 @@ async fn main() -> ExitCode {
         .route("/order/accept", post(accept))
         .route("/order/fiat_sent", post(fiat_sent))
         .route("/order/release", post(release))
+        .route("/order/retry", post(retry))
+        .route("/order/dispute", post(open_dispute))
+        .route("/order/chat", post(post_chat))
+        .route("/order/award_buyer", post(award_buyer))
+        .route("/order/award_seller", post(award_seller))
         .layer(local_cors())
-        .with_state(App {
-            config,
-            rpc: FiberRpc::new(),
-            orders,
-        });
+        .with_state(app_state);
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -68,6 +75,26 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+async fn hold_expiry_poller(app: App) {
+    let mut ticker = tokio::time::interval(HOLD_EXPIRY_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        match app.orders.poll_hold_expiry(&app.rpc, &app.config).await {
+            Ok(Some(view)) => {
+                eprintln!(
+                    "path D poll: state={:?} invoice={:?}",
+                    view.state, view.invoice_status
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("path D poll error: {err:?}");
+            }
+        }
+    }
 }
 
 async fn health(State(app): State<App>) -> Json<Health> {
@@ -131,6 +158,45 @@ async fn fiat_sent(State(app): State<App>) -> Result<Json<OrderView>, ApiError> 
 async fn release(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
     app.orders
         .release(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn retry(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .retry(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn open_dispute(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .open_dispute(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn post_chat(
+    State(app): State<App>,
+    Json(body): Json<PostChatBody>,
+) -> Result<Json<OrderView>, ApiError> {
+    app.orders.post_chat(&body).map(Json).map_err(ApiError::from)
+}
+
+async fn award_buyer(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .award_buyer(&app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn award_seller(State(app): State<App>) -> Result<Json<OrderView>, ApiError> {
+    app.orders
+        .award_seller(&app.rpc, &app.config)
         .await
         .map(Json)
         .map_err(ApiError::from)
