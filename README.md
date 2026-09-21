@@ -8,11 +8,35 @@ Build order: [PLAN.md](PLAN.md).
 twine-fiber-poc/
   daemon/     Rust coordinator. Talks to fnn over JSON-RPC. Holds preimage S.
   app/        Flutter client. Seller, Buyer, and Solver roles.
+  scripts/    Download fnn, start the three testnet nodes, open the two channels.
 ```
 
 Three Fiber testnet nodes sit beside the daemon: seller, Twine, and buyer. The app never holds a Fiber key. It calls the daemon. The daemon calls `fnn`.
 
 Fiat is a button. The CKB movement is real: `new_invoice`, `send_payment`, `settle_invoice`, and TLC expiry on testnet (`Fibt`).
+
+## Stage 0
+
+Three Fiber v0.9.1 testnet nodes (seller, Twine, buyer) and the daemon. Node data, keys, and the fnn binary stay out of git.
+
+```bash
+./scripts/setup-nodes.sh
+./scripts/start-nodes.sh
+```
+
+`setup-nodes.sh` prints a testnet address for each node. Send CKB from [https://faucet.nervos.org](https://faucet.nervos.org) to all three. Seller needs at least 600 CKB and Twine at least 700 CKB, for a 500 CKB channel plus a change cell. The buyer needs at least 200 CKB: Fiber auto-accepts an incoming channel by locking about 99 CKB on that side.
+
+```bash
+./scripts/open-channels.sh
+cd daemon && cargo run
+curl -s http://127.0.0.1:8080/health
+```
+
+`open-channels.sh` connects the nodes and opens seller → Twine and Twine → buyer, 500 CKB each, then waits until both are `ChannelReady`.
+
+`GET /health` returns the three pubkeys and both channel balances. `ready` is true when those channels are `ChannelReady`. The daemon reads `SELLER_RPC`, `TWINE_RPC`, and `BUYER_RPC` (defaults `http://127.0.0.1:8227`, `:8237`, and `:8247`).
+
+`./scripts/stop-nodes.sh` stops the daemon and the three nodes. The node password is `nodes/password`.
 
 ## What a reviewer can do
 
