@@ -38,6 +38,19 @@ curl -s http://127.0.0.1:8080/health
 
 `./scripts/stop-nodes.sh` stops the daemon and the three nodes. The node password is `nodes/password`.
 
+## Stage 1
+
+The app creates one order. No Fiber payment yet. The daemon stores it in `order.json` in the daemon working directory (`ORDER_FILE` overrides that path).
+
+```bash
+cd daemon && cargo run
+cd app && flutter run
+```
+
+The screen has an amount field, Create order, a Seller / Buyer / Solver switch, and the order log. Create moves the order from `Idle` to `Pending`. Restart the app and it loads the same order from `GET /order`.
+
+On the iOS simulator the daemon URL is `http://127.0.0.1:8080`. On the Android emulator use `http://10.0.2.2:8080`. The app fills that in. A phone on the same network needs `LISTEN=0.0.0.0:8080` and the Mac's LAN address.
+
 ## What a reviewer can do
 
 1. Create a sell order for a small amount of testnet CKB.

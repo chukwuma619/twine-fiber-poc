@@ -1,4 +1,5 @@
 /bin/
 /nodes/
 /daemon/target/
+/daemon/order.json
 /target/
