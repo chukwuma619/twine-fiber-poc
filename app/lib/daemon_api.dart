@@ -2,217 +2,177 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
-class OrderLogLine {
-  const OrderLogLine({required this.at, required this.text});
-
-  final String at;
-  final String text;
-
-  factory OrderLogLine.fromJson(Map<String, dynamic> json) {
-    return OrderLogLine(
-      at: json['at'] as String? ?? '',
-      text: json['text'] as String? ?? '',
-    );
-  }
-}
-
-class ChatLine {
-  const ChatLine({required this.at, required this.from, required this.text});
-
-  final String at;
-  final String from;
-  final String text;
-
-  factory ChatLine.fromJson(Map<String, dynamic> json) {
-    return ChatLine(
-      at: json['at'] as String? ?? '',
-      from: json['from'] as String? ?? '',
-      text: json['text'] as String? ?? '',
-    );
-  }
-}
-
-class OrderSnapshot {
-  const OrderSnapshot({
-    required this.state,
-    required this.amount,
-    required this.paymentHash,
-    required this.invoiceAddress,
-    required this.invoiceStatus,
-    required this.log,
-    required this.chat,
-  });
-
-  final String state;
-  final String? amount;
-  final String? paymentHash;
-  final String? invoiceAddress;
-  final String? invoiceStatus;
-  final List<OrderLogLine> log;
-  final List<ChatLine> chat;
-
-  bool get isIdle => state == 'Idle';
-  bool get isPending => state == 'Pending';
-  bool get isWaitingHold => state == 'WaitingHold';
-  bool get isHeld => state == 'Held';
-  bool get isWaitingFiat => state == 'WaitingFiat';
-  bool get isFiatSent => state == 'FiatSent';
-  bool get isReleasing => state == 'Releasing';
-  bool get isLeg2Failed => state == 'Leg2Failed';
-  bool get isDisputed => state == 'Disputed';
-  bool get isSettled => state == 'Settled';
-  bool get isExpired => state == 'Expired';
-  bool get isOpen =>
-      !isIdle &&
-      state != 'Cancelled' &&
-      state != 'Paid' &&
-      state != 'Settled' &&
-      state != 'Expired';
-
-  bool get canOpenDispute =>
-      isWaitingFiat || isFiatSent || isLeg2Failed;
-
-  bool get sellerWinsLogged =>
-      log.any((line) => line.text.contains('solver awarded seller'));
-
-  bool get pathDExpiredLogged =>
-      log.any((line) => line.text.contains('path D: hold invoice Expired'));
-
-  /// Open hold that may still transition to Expired via TLC (Path D).
-  bool get watchesHoldExpiry {
-    switch (state) {
-      case 'Held':
-      case 'WaitingFiat':
-      case 'FiatSent':
-      case 'Leg2Failed':
-      case 'Disputed':
-      case 'Releasing':
-        return true;
-      default:
-        return false;
-    }
-  }
-
-  factory OrderSnapshot.fromJson(Map<String, dynamic> json) {
-    final rawLog = json['log'];
-    final log = <OrderLogLine>[];
-    if (rawLog is List) {
-      for (final line in rawLog) {
-        if (line is Map<String, dynamic>) {
-          log.add(OrderLogLine.fromJson(line));
-        }
-      }
-    }
-    final rawChat = json['chat'];
-    final chat = <ChatLine>[];
-    if (rawChat is List) {
-      for (final line in rawChat) {
-        if (line is Map<String, dynamic>) {
-          chat.add(ChatLine.fromJson(line));
-        }
-      }
-    }
-    return OrderSnapshot(
-      state: json['state'] as String? ?? 'Idle',
-      amount: json['amount'] as String?,
-      paymentHash: json['payment_hash'] as String?,
-      invoiceAddress: json['invoice_address'] as String?,
-      invoiceStatus: json['invoice_status'] as String?,
-      log: log,
-      chat: chat,
-    );
-  }
-}
-
-class DaemonException implements Exception {
-  const DaemonException(this.message);
-
-  final String message;
-
-  @override
-  String toString() => message;
-}
+import 'models.dart';
 
 class DaemonApi {
   DaemonApi({http.Client? client}) : _client = client ?? http.Client();
 
   final http.Client _client;
 
-  Future<OrderSnapshot> fetchOrder(String baseUrl) async {
-    final response = await _client.get(Uri.parse('${_root(baseUrl)}/order'));
-    return _read(response);
+  Future<List<AdSnapshot>> listAds(String baseUrl) async {
+    final decoded = await _getJson(baseUrl, '/ads');
+    if (decoded is! List) {
+      throw const DaemonException('daemon returned unexpected ads');
+    }
+    return [
+      for (final item in decoded)
+        if (item is Map<String, dynamic>) AdSnapshot.fromJson(item),
+    ];
   }
 
-  Future<OrderSnapshot> createOrder(String baseUrl, String amount) async {
-    return _post(baseUrl, '/order', body: {'amount': amount});
-  }
-
-  Future<OrderSnapshot> demoCancel(String baseUrl) async {
-    return _post(baseUrl, '/order/demo_cancel');
-  }
-
-  Future<OrderSnapshot> createHold(String baseUrl) async {
-    return _post(baseUrl, '/order/hold');
-  }
-
-  Future<OrderSnapshot> lock(String baseUrl) async {
-    return _post(baseUrl, '/order/lock');
-  }
-
-  Future<OrderSnapshot> tryCancel(String baseUrl) async {
-    return _post(baseUrl, '/order/try_cancel');
-  }
-
-  Future<OrderSnapshot> accept(String baseUrl) async {
-    return _post(baseUrl, '/order/accept');
-  }
-
-  Future<OrderSnapshot> fiatSent(String baseUrl) async {
-    return _post(baseUrl, '/order/fiat_sent');
-  }
-
-  Future<OrderSnapshot> release(String baseUrl) async {
-    return _post(baseUrl, '/order/release');
-  }
-
-  Future<OrderSnapshot> retry(String baseUrl) async {
-    return _post(baseUrl, '/order/retry');
-  }
-
-  Future<OrderSnapshot> openDispute(String baseUrl) async {
-    return _post(baseUrl, '/order/dispute');
-  }
-
-  Future<OrderSnapshot> postChat(
+  Future<AdSnapshot> createAd(
     String baseUrl, {
+    required String sellerPubkey,
+    required String sellerName,
+    required String availableCkb,
+    required String fiat,
+    required String rate,
+    required String paymentMethod,
+  }) async {
+    return AdSnapshot.fromJson(
+      await _postMap(baseUrl, '/ads', {
+        'seller_pubkey': sellerPubkey,
+        'seller_name': sellerName,
+        'available_ckb': availableCkb,
+        'fiat': fiat,
+        'rate': rate,
+        'payment_method': paymentMethod,
+      }),
+    );
+  }
+
+  Future<AdSnapshot> cancelAd(String baseUrl, String id) async {
+    return AdSnapshot.fromJson(await _postMap(baseUrl, '/ads/$id/cancel'));
+  }
+
+  Future<List<TradeSnapshot>> listTrades(String baseUrl, {String? pubkey}) async {
+    final path = pubkey == null || pubkey.isEmpty
+        ? '/trades'
+        : '/trades?pubkey=${Uri.encodeQueryComponent(pubkey)}';
+    final decoded = await _getJson(baseUrl, path);
+    if (decoded is! List) {
+      throw const DaemonException('daemon returned unexpected trades');
+    }
+    return [
+      for (final item in decoded)
+        if (item is Map<String, dynamic>) TradeSnapshot.fromJson(item),
+    ];
+  }
+
+  Future<TradeSnapshot> fetchTrade(String baseUrl, String id) async {
+    return TradeSnapshot.fromJson(
+      _asMap(await _getJson(baseUrl, '/trades/$id')),
+    );
+  }
+
+  Future<TradeSnapshot> createTrade(
+    String baseUrl, {
+    required String adId,
+    required String buyerPubkey,
+    required String buyerName,
+    required String fiatAmount,
+  }) async {
+    return _trade(baseUrl, '/trades', {
+      'ad_id': adId,
+      'buyer_pubkey': buyerPubkey,
+      'buyer_name': buyerName,
+      'fiat_amount': fiatAmount,
+    });
+  }
+
+  Future<TradeSnapshot> markLocked(String baseUrl, String id) {
+    return _trade(baseUrl, '/trades/$id/locked');
+  }
+
+  Future<TradeSnapshot> fiatSent(
+    String baseUrl,
+    String id, {
+    required String invoice,
+  }) {
+    return _trade(baseUrl, '/trades/$id/fiat_sent', {'invoice': invoice});
+  }
+
+  Future<TradeSnapshot> release(String baseUrl, String id) {
+    return _trade(baseUrl, '/trades/$id/release');
+  }
+
+  Future<TradeSnapshot> retry(
+    String baseUrl,
+    String id, {
+    required String invoice,
+  }) {
+    return _trade(baseUrl, '/trades/$id/retry', {'invoice': invoice});
+  }
+
+  Future<TradeSnapshot> openDispute(String baseUrl, String id) {
+    return _trade(baseUrl, '/trades/$id/dispute');
+  }
+
+  Future<TradeSnapshot> postChat(
+    String baseUrl,
+    String id, {
     required String from,
     required String text,
-  }) async {
-    return _post(baseUrl, '/order/chat', body: {'from': from, 'text': text});
+  }) {
+    return _trade(baseUrl, '/trades/$id/chat', {'from': from, 'text': text});
   }
 
-  Future<OrderSnapshot> awardBuyer(String baseUrl) async {
-    return _post(baseUrl, '/order/award_buyer');
-  }
-
-  Future<OrderSnapshot> awardSeller(String baseUrl) async {
-    return _post(baseUrl, '/order/award_seller');
-  }
-
-  Future<OrderSnapshot> _post(
+  Future<TradeSnapshot> awardBuyer(
     String baseUrl,
-    String path, {
-    Map<String, Object?>? body,
+    String id, {
+    required String invoice,
+  }) {
+    return _trade(baseUrl, '/trades/$id/award_buyer', {'invoice': invoice});
+  }
+
+  Future<TradeSnapshot> awardSeller(String baseUrl, String id) {
+    return _trade(baseUrl, '/trades/$id/award_seller');
+  }
+
+  Future<TwineInfo> fetchTwine(String baseUrl) async {
+    return TwineInfo.fromJson(_asMap(await _getJson(baseUrl, '/twine')));
+  }
+
+  Future<ConnectResult> connect(
+    String baseUrl, {
+    required String pubkey,
+    required String address,
   }) async {
+    return ConnectResult.fromJson(
+      await _postMap(baseUrl, '/connect', {
+        'pubkey': pubkey,
+        'address': address,
+      }),
+    );
+  }
+
+  Future<TradeSnapshot> _trade(
+    String baseUrl,
+    String path, [
+    Map<String, Object?>? body,
+  ]) async {
+    return TradeSnapshot.fromJson(await _postMap(baseUrl, path, body));
+  }
+
+  Future<Object?> _getJson(String baseUrl, String path) async {
+    final response = await _client.get(Uri.parse('${_root(baseUrl)}$path'));
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> _postMap(
+    String baseUrl,
+    String path, [
+    Map<String, Object?>? body,
+  ]) async {
     final response = await _client.post(
       Uri.parse('${_root(baseUrl)}$path'),
       headers: const {'content-type': 'application/json'},
       body: body == null ? '{}' : jsonEncode(body),
     );
-    return _read(response);
+    return _asMap(_decode(response));
   }
 
-  OrderSnapshot _read(http.Response response) {
+  Object? _decode(http.Response response) {
     final decoded = response.body.isEmpty ? null : jsonDecode(response.body);
     if (response.statusCode >= 400) {
       final message = decoded is Map && decoded['error'] is String
@@ -220,10 +180,14 @@ class DaemonApi {
           : 'daemon returned ${response.statusCode}';
       throw DaemonException(message);
     }
+    return decoded;
+  }
+
+  Map<String, dynamic> _asMap(Object? decoded) {
     if (decoded is! Map<String, dynamic>) {
-      throw const DaemonException('daemon returned an unexpected order');
+      throw const DaemonException('daemon returned an unexpected body');
     }
-    return OrderSnapshot.fromJson(decoded);
+    return decoded;
   }
 
   String _root(String baseUrl) {

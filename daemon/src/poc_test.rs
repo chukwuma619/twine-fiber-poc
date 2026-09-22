@@ -1,6 +1,6 @@
 //! One walk of the proof of concept against a fake Fiber node.
 //!
-//! Create, cancel-while-open, hold, lock, refuse cancel after Received,
+//! Post an ad, take it, cancel-while-open, lock, refuse cancel after Received,
 //! path B then a path A retry, path C both ways, then path D expiry.
 
 use std::collections::HashMap;
@@ -13,15 +13,18 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{OrderError, OrderState, OrderStore, OrderView, PostChatBody};
+use super::{
+    BuyerInvoiceBody, CreateAdBody, CreateTradeBody, OrderError, OrderState, PostChatBody, TradeView,
+};
 use crate::health::Config;
+use crate::market::MarketStore;
 use crate::rpc::FiberRpc;
 
 const ONE_CKB: &str = "0x5f5e100";
 const EXPIRY_DELTA: &str = "0x36ee800";
 const PEER: &str = "02cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const LOCAL_IN_FLIGHT: &str = "0x1dcd6500";
-const LOCAL_RESTORED: &str = "0x2faf0800";
+const SELLER: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const BUYER: &str = "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 struct Hold {
     address: String,
@@ -32,10 +35,7 @@ struct FiberNode {
     holds: HashMap<String, Hold>,
     demos: HashMap<String, String>,
     payments: HashMap<String, String>,
-    last_buyer_invoice: Option<String>,
-    active_hold: Option<String>,
     fail_twine_payments: u32,
-    seller_local: String,
     pay_seq: u32,
     calls: Vec<String>,
     cancels: Vec<String>,
@@ -58,68 +58,78 @@ async fn walks_hold_release_dispute_and_expiry() {
     let fiber = Arc::new(Mutex::new(FiberNode::new()));
     let config = serve(Arc::clone(&fiber)).await;
     let rpc = FiberRpc::new();
-    let store = OrderStore::open(path.clone()).unwrap();
+    let store = MarketStore::open(path.clone()).unwrap();
 
     assert!(store
-        .poll_hold_expiry(&rpc, &config)
+        .poll_all_hold_expiry(&rpc, &config)
         .await
         .unwrap()
-        .is_none());
+        .is_empty());
 
-    // Unpaid cancel leaves the live order Pending. A second create is refused.
-    let created = store.create("1").unwrap();
-    assert_eq!(created.state, OrderState::Pending);
-    assert_eq!(store.create("9").unwrap_err(), OrderError::AlreadyOpen);
-    let after_demo = store.demo_cancel(&rpc, &config).await.unwrap();
-    assert_eq!(after_demo.state, OrderState::Pending);
-    assert!(after_demo.payment_hash.is_none());
+    let created = start_trade(&store, &rpc, &config).await;
+    assert_eq!(created.state, OrderState::WaitingHold);
+    assert_eq!(created.invoice_status.as_deref(), Some("Open"));
+    assert!(log_contains(&created, "S sealed"));
+    assert_hides_preimage(&created, &path);
+    let hold_hash = created.payment_hash.clone().unwrap();
+    let trade_id = created.id.clone();
+    let reloaded = MarketStore::open(path.clone()).unwrap();
+    assert_eq!(
+        reloaded.get_trade(&trade_id).unwrap().payment_hash.as_deref(),
+        Some(hold_hash.as_str())
+    );
+    assert!(reloaded.persisted_preimage(&trade_id).is_some());
+
+    let after_demo = store.demo_cancel(&trade_id, &rpc, &config).await.unwrap();
+    assert_eq!(after_demo.state, OrderState::WaitingHold);
     assert!(log_contains(&after_demo, "demo cancel"));
     assert!(log_contains(&after_demo, "Cancelled"));
 
-    let waiting = store.create_hold(&rpc, &config).await.unwrap();
-    assert_eq!(waiting.state, OrderState::WaitingHold);
-    assert_eq!(waiting.invoice_status.as_deref(), Some("Open"));
-    assert!(log_contains(&waiting, "S sealed"));
-    assert_hides_preimage(&waiting, &path);
-    let hold_hash = waiting.payment_hash.clone().unwrap();
-    let reloaded = OrderStore::open(path.clone()).unwrap();
-    assert_eq!(reloaded.snapshot().payment_hash.as_deref(), Some(hold_hash.as_str()));
-    assert!(reloaded.guard().payment_preimage.is_some());
+    assert!(matches!(
+        start_trade_on(&store, &rpc, &config, &created.ad_id).await,
+        Err(OrderError::AlreadyOpen)
+    ));
 
-    let held = store.lock_payment(&rpc, &config).await.unwrap();
-    assert_eq!(held.state, OrderState::Held);
-    assert_eq!(held.invoice_status.as_deref(), Some("Received"));
+    mark_received(&fiber, &hold_hash);
+    let locked = store.mark_locked(&trade_id, &rpc, &config).await.unwrap();
+    assert_eq!(locked.state, OrderState::WaitingFiat);
+    assert_eq!(locked.invoice_status.as_deref(), Some("Received"));
     assert_eq!(fiber.lock().unwrap().status_of(&hold_hash), "Received");
     let cancels_before = fiber.lock().unwrap().cancels.len();
-    let skipped = store.try_cancel(&rpc, &config).await.unwrap();
-    assert_eq!(skipped.state, OrderState::Held);
+    let skipped = store.try_cancel(&trade_id, &rpc, &config).await.unwrap();
+    assert_eq!(skipped.state, OrderState::WaitingFiat);
     assert!(log_contains(&skipped, "cancel_invoice not applied"));
     assert_eq!(fiber.lock().unwrap().cancels.len(), cancels_before);
 
-    store.accept().unwrap();
-    let fiat_sent = store.fiat_sent().unwrap();
+    let fiat_sent = store
+        .fiat_sent(&trade_id, &buyer_invoice("1"))
+        .unwrap();
     assert_eq!(fiat_sent.state, OrderState::FiatSent);
 
-    // Path B: paying the buyer fails. The hold stays Received and is not settled.
     fiber.lock().unwrap().fail_twine_payments = 1;
     let marked = call_len(&fiber);
-    let failed = store.release(&rpc, &config).await.unwrap();
+    let failed = store.release(&trade_id, &rpc, &config).await.unwrap();
     assert_eq!(failed.state, OrderState::Leg2Failed);
     assert_eq!(failed.invoice_status.as_deref(), Some("Received"));
     assert!(log_contains(&failed, "settle_invoice not called"));
     assert!(log_contains(&failed, "TLC expires"));
     assert!(!failed.log.iter().any(|line| line.text.contains("settle:")));
-    assert_eq!(store.create("1").unwrap_err(), OrderError::AlreadyOpen);
     let failed_calls = calls_since(&fiber, marked);
-    assert!(failed_calls.iter().any(|call| call == "buyer new_invoice"));
     assert!(failed_calls.iter().any(|call| call == "twine send_payment"));
-    assert!(!failed_calls.iter().any(|call| call.contains("settle_invoice")));
-    assert!(!failed_calls.iter().any(|call| call.contains("cancel_invoice")));
+    assert!(!failed_calls
+        .iter()
+        .any(|call| call.contains("settle_invoice")));
+    assert!(!failed_calls
+        .iter()
+        .any(|call| call.contains("cancel_invoice")));
+    assert!(!failed_calls.iter().any(|call| call.contains("new_invoice")));
     assert_eq!(fiber.lock().unwrap().status_of(&hold_hash), "Received");
 
-    // Retry is path A: pay the buyer, then settle. Pay is logged before settle.
     let marked = call_len(&fiber);
-    let settled = store.retry(&rpc, &config).await.unwrap();
+    let settled = store
+        .retry(&trade_id, &rpc, &config, &buyer_invoice("2"))
+        .await
+        .unwrap();
     assert_eq!(settled.state, OrderState::Settled);
     assert_eq!(settled.invoice_status.as_deref(), Some("Paid"));
     assert!(log_contains(&settled, "path A complete"));
@@ -127,23 +137,35 @@ async fn walks_hold_release_dispute_and_expiry() {
     assert_hides_preimage(&settled, &path);
     assert_pay_then_settle_calls(&calls_since(&fiber, marked));
     assert_eq!(fiber.lock().unwrap().status_of(&hold_hash), "Paid");
-    assert!(store.poll_hold_expiry(&rpc, &config).await.unwrap().is_none());
+    assert!(store
+        .poll_hold_expiry(&trade_id, &rpc, &config)
+        .await
+        .unwrap()
+        .is_none());
 
-    // Path C, buyer wins, but the first route fails and must not settle.
-    let disputed = open_dispute(&store, &rpc, &config, &path).await;
+    let disputed = open_dispute(&store, &fiber, &rpc, &config, &path).await;
+    let disputed_id = disputed.id.clone();
     let disputed_hash = disputed.payment_hash.clone().unwrap();
     fiber.lock().unwrap().fail_twine_payments = 1;
     let marked = call_len(&fiber);
-    let stayed = store.award_buyer(&rpc, &config).await.unwrap();
+    let stayed = store
+        .award_buyer(&disputed_id, &rpc, &config, &buyer_invoice("3"))
+        .await
+        .unwrap();
     assert_eq!(stayed.state, OrderState::Disputed);
     assert_eq!(stayed.invoice_status.as_deref(), Some("Received"));
     assert!(log_contains(&stayed, "stay Disputed"));
     assert!(log_contains(&stayed, "settle_invoice not called"));
-    assert!(!calls_since(&fiber, marked).iter().any(|call| call.contains("settle_invoice")));
+    assert!(!calls_since(&fiber, marked)
+        .iter()
+        .any(|call| call.contains("settle_invoice")));
     assert_eq!(fiber.lock().unwrap().status_of(&disputed_hash), "Received");
 
     let marked = call_len(&fiber);
-    let buyer_wins = store.award_buyer(&rpc, &config).await.unwrap();
+    let buyer_wins = store
+        .award_buyer(&disputed_id, &rpc, &config, &buyer_invoice("4"))
+        .await
+        .unwrap();
     assert_eq!(buyer_wins.state, OrderState::Settled);
     assert_eq!(buyer_wins.invoice_status.as_deref(), Some("Paid"));
     assert!(log_contains(&buyer_wins, "path C buyer wins complete"));
@@ -151,27 +173,33 @@ async fn walks_hold_release_dispute_and_expiry() {
     assert_pay_then_settle_calls(&calls_since(&fiber, marked));
     assert_hides_preimage(&buyer_wins, &path);
 
-    // Path C, seller wins: chat is stored, nothing is settled or cancelled.
-    let seller_case = open_dispute(&store, &rpc, &config, &path).await;
+    let seller_case = open_dispute(&store, &fiber, &rpc, &config, &path).await;
+    let seller_id = seller_case.id.clone();
     let seller_hash = seller_case.payment_hash.clone().unwrap();
     store
-        .post_chat(&PostChatBody {
-            from: "buyer".into(),
-            text: "I sent the fiat".into(),
-        })
+        .post_chat(
+            &seller_id,
+            &PostChatBody {
+                from: "buyer".into(),
+                text: "I sent the fiat".into(),
+            },
+        )
         .unwrap();
     let chat = store
-        .post_chat(&PostChatBody {
-            from: "seller".into(),
-            text: "I never got it".into(),
-        })
+        .post_chat(
+            &seller_id,
+            &PostChatBody {
+                from: "seller".into(),
+                text: "I never got it".into(),
+            },
+        )
         .unwrap();
     assert_eq!(chat.chat.len(), 2);
     assert_eq!(chat.chat[0].text, "I sent the fiat");
     assert_eq!(chat.chat[1].from, "seller");
     assert_hides_preimage(&chat, &path);
     let marked = call_len(&fiber);
-    let seller_wins = store.award_seller(&rpc, &config).await.unwrap();
+    let seller_wins = store.award_seller(&seller_id, &rpc, &config).await.unwrap();
     assert_eq!(seller_wins.state, OrderState::Disputed);
     assert_eq!(seller_wins.invoice_status.as_deref(), Some("Received"));
     assert!(log_contains(
@@ -181,76 +209,205 @@ async fn walks_hold_release_dispute_and_expiry() {
     assert!(log_contains(&seller_wins, "TLC expiry"));
     let award_calls = calls_since(&fiber, marked);
     assert!(award_calls.iter().any(|call| call == "twine get_invoice"));
-    assert!(!award_calls.iter().any(|call| call.contains("settle_invoice")));
-    assert!(!award_calls.iter().any(|call| call.contains("cancel_invoice")));
-    assert_eq!(store.create("1").unwrap_err(), OrderError::AlreadyOpen);
+    assert!(!award_calls
+        .iter()
+        .any(|call| call.contains("settle_invoice")));
+    assert!(!award_calls
+        .iter()
+        .any(|call| call.contains("cancel_invoice")));
+    assert!(matches!(
+        start_trade_on(&store, &rpc, &config, &seller_case.ad_id).await,
+        Err(OrderError::AlreadyOpen)
+    ));
     assert_eq!(fiber.lock().unwrap().status_of(&seller_hash), "Received");
 
-    // Once Fiber expires the hold, both awards fail and the seller is refunded.
     {
         let mut node = fiber.lock().unwrap();
         node.holds.get_mut(&seller_hash).unwrap().status = "Expired".into();
-        node.seller_local = LOCAL_RESTORED.into();
     }
     let marked = call_len(&fiber);
     assert!(matches!(
-        store.award_buyer(&rpc, &config).await.unwrap_err(),
+        store
+            .award_buyer(&seller_id, &rpc, &config, &buyer_invoice("5"))
+            .await
+            .unwrap_err(),
         OrderError::BadState(message) if message.contains("Expired")
     ));
     assert!(matches!(
-        store.award_seller(&rpc, &config).await.unwrap_err(),
+        store.award_seller(&seller_id, &rpc, &config).await.unwrap_err(),
         OrderError::BadState(message) if message.contains("Expired")
     ));
-    assert!(!calls_since(&fiber, marked).iter().any(|call| call.contains("settle_invoice")));
-    assert_eq!(store.snapshot().state, OrderState::Disputed);
+    assert!(!calls_since(&fiber, marked)
+        .iter()
+        .any(|call| call.contains("settle_invoice")));
+    assert_eq!(
+        store.get_trade(&seller_id).unwrap().state,
+        OrderState::Disputed
+    );
 
-    let expired = store.poll_hold_expiry(&rpc, &config).await.unwrap().unwrap();
+    let expired = store
+        .poll_hold_expiry(&seller_id, &rpc, &config)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(expired.state, OrderState::Expired);
     assert_eq!(expired.invoice_status.as_deref(), Some("Expired"));
     assert!(log_contains(&expired, "path D: hold invoice Expired"));
-    assert!(log_contains(&expired, "seller refunded because the TLC expired"));
+    assert!(log_contains(
+        &expired,
+        "seller refunded because the TLC expired"
+    ));
     assert!(log_contains(&expired, "cancel_invoice not called"));
     assert!(log_contains(
         &expired,
         "settle_invoice(H, S) after expiry failed as expected"
     ));
-    assert!(log_contains(&expired, LOCAL_IN_FLIGHT));
-    assert!(log_contains(&expired, LOCAL_RESTORED));
     assert!(!log_contains(&expired, "path A complete"));
     assert!(!log_contains(&expired, "path C buyer wins"));
     assert_hides_preimage(&expired, &path);
     assert_eq!(fiber.lock().unwrap().status_of(&seller_hash), "Expired");
-    assert!(store.poll_hold_expiry(&rpc, &config).await.unwrap().is_none());
+    assert!(store
+        .poll_hold_expiry(&seller_id, &rpc, &config)
+        .await
+        .unwrap()
+        .is_none());
 
-    let next = store.create("1").unwrap();
-    assert_eq!(next.state, OrderState::Pending);
+    let ads = store.list_ads();
+    let restored = ads
+        .iter()
+        .find(|ad| ad.id == seller_case.ad_id)
+        .expect("ad remains after expiry");
+    assert_eq!(restored.available_ckb, "1");
+    let next = start_trade_on(&store, &rpc, &config, &seller_case.ad_id)
+        .await
+        .unwrap();
+    assert_eq!(next.state, OrderState::WaitingHold);
 
     let node = fiber.lock().unwrap();
     assert!(node.faults.is_empty(), "{:?}", node.faults);
     assert!(!node.cancels.is_empty());
     for hash in node.holds.keys() {
-        assert!(!node.cancels.iter().any(|cancelled| cancelled == hash), "{hash}");
+        assert!(
+            !node.cancels.iter().any(|cancelled| cancelled == hash),
+            "{hash}"
+        );
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ad_reserve_blocks_second_take_and_returns_on_cancel() {
+    let path = temp_path();
+    let _remove = RemoveFile(path.clone());
+    let fiber = Arc::new(Mutex::new(FiberNode::new()));
+    let config = serve(Arc::clone(&fiber)).await;
+    let rpc = FiberRpc::new();
+    let store = MarketStore::open(path).unwrap();
+
+    let ad = post_ad(&store, "1");
+    let first = start_trade_on(&store, &rpc, &config, &ad.id)
+        .await
+        .unwrap();
+    assert!(!store.list_ads().iter().any(|listed| listed.id == ad.id));
+    assert!(matches!(
+        start_trade_on(&store, &rpc, &config, &ad.id).await,
+        Err(OrderError::AlreadyOpen)
+    ));
+
+    let cancelled = store.try_cancel(&first.id, &rpc, &config).await.unwrap();
+    assert_eq!(cancelled.state, OrderState::Cancelled);
+    let restored = store
+        .list_ads()
+        .into_iter()
+        .find(|listed| listed.id == ad.id)
+        .expect("cancelled trade returns CKB to the ad");
+    assert_eq!(restored.available_ckb, "1");
+
+    let second = start_trade_on(&store, &rpc, &config, &ad.id)
+        .await
+        .unwrap();
+    assert_eq!(second.state, OrderState::WaitingHold);
+    assert!(!store.list_ads().iter().any(|listed| listed.id == ad.id));
+}
+
 async fn open_dispute(
-    store: &OrderStore,
+    store: &MarketStore,
+    fiber: &Mutex<FiberNode>,
     rpc: &FiberRpc,
     config: &Config,
     path: &Path,
-) -> OrderView {
-    store.create("1").unwrap();
-    let waiting = store.create_hold(rpc, config).await.unwrap();
+) -> TradeView {
+    let waiting = start_trade(store, rpc, config).await;
     assert_eq!(waiting.state, OrderState::WaitingHold);
     assert!(log_contains(&waiting, EXPIRY_DELTA));
-    let held = store.lock_payment(rpc, config).await.unwrap();
-    assert_eq!(held.invoice_status.as_deref(), Some("Received"));
-    store.accept().unwrap();
-    let disputed = store.open_dispute(rpc, config).await.unwrap();
+    let hash = waiting.payment_hash.clone().unwrap();
+    mark_received(fiber, &hash);
+    let locked = store.mark_locked(&waiting.id, rpc, config).await.unwrap();
+    assert_eq!(locked.invoice_status.as_deref(), Some("Received"));
+    let disputed = store.open_dispute(&waiting.id, rpc, config).await.unwrap();
     assert_eq!(disputed.state, OrderState::Disputed);
     assert_eq!(disputed.invoice_status.as_deref(), Some("Received"));
     assert_hides_preimage(&disputed, path);
     disputed
+}
+
+async fn start_trade(
+    store: &MarketStore,
+    rpc: &FiberRpc,
+    config: &Config,
+) -> TradeView {
+    let ad = post_ad(store, "1");
+    start_trade_on(store, rpc, config, &ad.id)
+        .await
+        .expect("create trade")
+}
+
+async fn start_trade_on(
+    store: &MarketStore,
+    rpc: &FiberRpc,
+    config: &Config,
+    ad_id: &str,
+) -> Result<TradeView, OrderError> {
+    store
+        .create_trade(
+            rpc,
+            config,
+            &CreateTradeBody {
+                ad_id: ad_id.into(),
+                buyer_pubkey: BUYER.into(),
+                buyer_name: "Ben".into(),
+                fiat_amount: "2000".into(),
+            },
+        )
+        .await
+}
+
+fn post_ad(store: &MarketStore, available: &str) -> crate::market::AdView {
+    store
+        .create_ad(&CreateAdBody {
+            seller_pubkey: SELLER.into(),
+            seller_name: "Ada".into(),
+            available_ckb: available.into(),
+            fiat: Some("NGN".into()),
+            rate: "2000".into(),
+            payment_method: "Opay".into(),
+        })
+        .unwrap()
+}
+
+fn buyer_invoice(seq: &str) -> BuyerInvoiceBody {
+    BuyerInvoiceBody {
+        invoice: format!("fibb1buyer{seq}"),
+    }
+}
+
+fn mark_received(fiber: &Mutex<FiberNode>, hash: &str) {
+    fiber
+        .lock()
+        .unwrap()
+        .holds
+        .get_mut(hash)
+        .expect("hold")
+        .status = "Received".into();
 }
 
 async fn serve(fiber: Arc<Mutex<FiberNode>>) -> Config {
@@ -264,9 +421,9 @@ async fn serve(fiber: Arc<Mutex<FiberNode>>) -> Config {
     });
     let config = Config {
         listen: "127.0.0.1:9".into(),
-        seller_rpc: format!("http://{addr}/seller"),
         twine_rpc: format!("http://{addr}/twine"),
-        buyer_rpc: format!("http://{addr}/buyer"),
+        twine_p2p: "/ip4/127.0.0.1/tcp/8238".into(),
+        funding_shannons: 50_000_000_000,
     };
     let rpc = FiberRpc::new();
     for _ in 0..50 {
@@ -309,10 +466,7 @@ impl FiberNode {
             holds: HashMap::new(),
             demos: HashMap::new(),
             payments: HashMap::new(),
-            last_buyer_invoice: None,
-            active_hold: None,
             fail_twine_payments: 0,
-            seller_local: LOCAL_IN_FLIGHT.into(),
             pay_seq: 0,
             calls: Vec::new(),
             cancels: Vec::new(),
@@ -339,7 +493,7 @@ impl FiberNode {
                     "pubkey": PEER,
                     "funding_udt_type_script": null,
                     "state": {"state_name": "ChannelReady"},
-                    "local_balance": self.seller_local,
+                    "local_balance": "0x1dcd6500",
                     "remote_balance": "0x0"
                 }]
             })),
@@ -363,17 +517,6 @@ impl FiberNode {
         if arg.get("payment_preimage").is_some() {
             return self.fault("new_invoice must not carry payment_preimage".into());
         }
-        let description = field(arg, "description");
-        if node == "buyer" {
-            if arg.get("payment_hash").is_some() {
-                return self.fault("buyer invoice is a normal invoice".into());
-            }
-            self.pay_seq += 1;
-            let hash = format!("0xbuyer{:x}", self.pay_seq);
-            let address = format!("fibb1buyer{:x}", self.pay_seq);
-            self.last_buyer_invoice = Some(address.clone());
-            return ok(invoice_json(&hash, &address, "Open"));
-        }
         if node != "twine" {
             return self.fault(format!("new_invoice on {node}"));
         }
@@ -382,6 +525,7 @@ impl FiberNode {
             return self.fault("twine new_invoice missing payment_hash".into());
         }
         let address = format!("fibb1{hash}");
+        let description = field(arg, "description");
         if description.contains("demo cancel") {
             self.demos.insert(hash.into(), "Open".into());
             return ok(invoice_json(hash, &address, "Open"));
@@ -399,20 +543,25 @@ impl FiberNode {
                 status: "Open".into(),
             },
         );
-        self.active_hold = Some(hash.into());
         ok(invoice_json(hash, &address, "Open"))
     }
 
     fn cancel_invoice(&mut self, arg: &Value) -> Value {
         let hash = field(arg, "payment_hash");
         self.cancels.push(hash.into());
-        match self.demos.get_mut(hash) {
-            Some(status) if status == "Open" => {
+        if let Some(status) = self.demos.get_mut(hash) {
+            if status == "Open" {
                 *status = "Cancelled".into();
-                ok(json!({"status": "Cancelled", "payment_hash": hash}))
+                return ok(json!({"status": "Cancelled", "payment_hash": hash}));
             }
-            _ => self.fault(format!("cancel_invoice refused for {hash}")),
         }
+        if let Some(hold) = self.holds.get_mut(hash) {
+            if hold.status == "Open" {
+                hold.status = "Cancelled".into();
+                return ok(json!({"status": "Cancelled", "payment_hash": hash}));
+            }
+        }
+        self.fault(format!("cancel_invoice refused for {hash}"))
     }
 
     fn get_invoice(&mut self, arg: &Value) -> Value {
@@ -428,20 +577,6 @@ impl FiberNode {
 
     fn send_payment(&mut self, node: &str, arg: &Value) -> Value {
         let invoice = field(arg, "invoice");
-        if node == "seller" {
-            let Some(hash) = self.active_hold.clone() else {
-                return self.fault("seller send_payment with no hold".into());
-            };
-            let expected = self.holds.get(&hash).map(|hold| hold.address.clone());
-            let Some(expected) = expected else {
-                return self.fault("seller send_payment missing hold".into());
-            };
-            if expected != invoice {
-                return self.fault(format!("seller paid {invoice}, hold is {expected}"));
-            }
-            self.holds.get_mut(&hash).unwrap().status = "Received".into();
-            return ok(json!({"payment_hash": hash, "status": "Inflight"}));
-        }
         if node != "twine" {
             return self.fault(format!("send_payment on {node}"));
         }
@@ -449,7 +584,7 @@ impl FiberNode {
             self.fail_twine_payments -= 1;
             return fail("no route to buyer");
         }
-        if self.last_buyer_invoice.as_deref() != Some(invoice) {
+        if !invoice.starts_with("fibb1buyer") {
             return self.fault(format!("twine paid unexpected invoice {invoice}"));
         }
         self.pay_seq += 1;
@@ -526,11 +661,11 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-fn log_contains(view: &OrderView, needle: &str) -> bool {
+fn log_contains(view: &TradeView, needle: &str) -> bool {
     view.log.iter().any(|line| line.text.contains(needle))
 }
 
-fn assert_pay_then_settle(view: &OrderView) {
+fn assert_pay_then_settle(view: &TradeView) {
     let pay = view
         .log
         .iter()
@@ -554,12 +689,12 @@ fn assert_pay_then_settle_calls(calls: &[String]) {
         .position(|call| call == "twine settle_invoice")
         .expect("twine settle_invoice");
     assert!(pay < settle, "{calls:?}");
-    assert!(calls.iter().any(|call| call == "buyer new_invoice"));
+    assert!(!calls.iter().any(|call| call.contains("new_invoice")));
 }
 
-fn assert_hides_preimage(view: &OrderView, path: &Path) {
+fn assert_hides_preimage(view: &TradeView, path: &Path) {
     let file: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let preimage = file["payment_preimage"]
+    let preimage = file["trades"][&view.id]["payment_preimage"]
         .as_str()
         .expect("preimage stays on disk");
     let json = serde_json::to_string(view).unwrap();

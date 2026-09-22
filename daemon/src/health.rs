@@ -1,25 +1,30 @@
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::rpc::FiberRpc;
 
 const SHANNONS_PER_CKB: u128 = 100_000_000;
+const DEFAULT_FUNDING_SHANNONS: u128 = 50_000_000_000;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen: String,
-    pub seller_rpc: String,
     pub twine_rpc: String,
-    pub buyer_rpc: String,
+    pub twine_p2p: String,
+    pub funding_shannons: u128,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         Self {
             listen: env_or("LISTEN", "127.0.0.1:8080"),
-            seller_rpc: env_or("SELLER_RPC", "http://127.0.0.1:8227"),
             twine_rpc: env_or("TWINE_RPC", "http://127.0.0.1:8237"),
-            buyer_rpc: env_or("BUYER_RPC", "http://127.0.0.1:8247"),
+            twine_p2p: env_or("TWINE_P2P", "/ip4/127.0.0.1/tcp/8238"),
+            funding_shannons: parse_u128(&env_or(
+                "FUNDING_SHANNONS",
+                &DEFAULT_FUNDING_SHANNONS.to_string(),
+            ))
+            .unwrap_or(DEFAULT_FUNDING_SHANNONS),
         }
     }
 }
@@ -34,15 +39,7 @@ fn env_or(name: &str, default: &str) -> String {
 #[derive(Serialize)]
 pub struct Health {
     pub ready: bool,
-    pub nodes: Nodes,
-    pub channels: Channels,
-}
-
-#[derive(Serialize)]
-pub struct Nodes {
-    pub seller: NodeHealth,
     pub twine: NodeHealth,
-    pub buyer: NodeHealth,
 }
 
 #[derive(Serialize)]
@@ -54,73 +51,146 @@ pub struct NodeHealth {
 }
 
 #[derive(Serialize)]
-pub struct Channels {
-    pub seller_to_twine: ChannelHealth,
-    pub twine_to_buyer: ChannelHealth,
-}
-
-#[derive(Serialize)]
-pub struct ChannelHealth {
-    pub funder: &'static str,
-    pub counterparty: &'static str,
-    pub open: bool,
-    pub channel_id: Option<String>,
-    pub state: Option<String>,
-    pub local_balance: Option<String>,
-    pub remote_balance: Option<String>,
-    pub local_balance_ckb: Option<String>,
-    pub remote_balance_ckb: Option<String>,
+pub struct TwineInfo {
+    pub rpc: String,
+    pub pubkey: Option<String>,
+    pub p2p_address: String,
+    pub node_name: Option<String>,
     pub error: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct ConnectResult {
+    pub connected: bool,
+    pub channel_open: bool,
+    pub channel_id: Option<String>,
+    pub message: String,
+}
+
 pub async fn health_report(rpc: &FiberRpc, config: &Config) -> Health {
-    let (seller_info, twine_info, buyer_info) = tokio::join!(
-        rpc.call(&config.seller_rpc, "node_info", Value::Array(vec![])),
-        rpc.call(&config.twine_rpc, "node_info", Value::Array(vec![])),
-        rpc.call(&config.buyer_rpc, "node_info", Value::Array(vec![])),
-    );
-
-    let seller = node_health(&config.seller_rpc, seller_info);
+    let twine_info = rpc
+        .call(&config.twine_rpc, "node_info", Value::Array(vec![]))
+        .await;
     let twine = node_health(&config.twine_rpc, twine_info);
-    let buyer = node_health(&config.buyer_rpc, buyer_info);
-
-    let seller_to_twine = channel_between(
-        rpc,
-        &config.seller_rpc,
-        "seller",
-        "twine",
-        seller.pubkey.as_deref(),
-        twine.pubkey.as_deref(),
-    )
-    .await;
-    let twine_to_buyer = channel_between(
-        rpc,
-        &config.twine_rpc,
-        "twine",
-        "buyer",
-        twine.pubkey.as_deref(),
-        buyer.pubkey.as_deref(),
-    )
-    .await;
-
-    let ready = seller.pubkey.is_some()
-        && twine.pubkey.is_some()
-        && buyer.pubkey.is_some()
-        && seller_to_twine.open
-        && twine_to_buyer.open;
-
     Health {
-        ready,
-        nodes: Nodes {
-            seller,
-            twine,
-            buyer,
+        ready: twine.pubkey.is_some(),
+        twine,
+    }
+}
+
+pub async fn twine_info(rpc: &FiberRpc, config: &Config) -> TwineInfo {
+    let info = rpc
+        .call(&config.twine_rpc, "node_info", Value::Array(vec![]))
+        .await;
+    match info {
+        Ok(value) => TwineInfo {
+            rpc: config.twine_rpc.clone(),
+            pubkey: value
+                .get("pubkey")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            p2p_address: config.twine_p2p.clone(),
+            node_name: value
+                .get("node_name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error: None,
         },
-        channels: Channels {
-            seller_to_twine,
-            twine_to_buyer,
+        Err(err) => TwineInfo {
+            rpc: config.twine_rpc.clone(),
+            pubkey: None,
+            p2p_address: config.twine_p2p.clone(),
+            node_name: None,
+            error: Some(err),
         },
     }
+}
+
+pub async fn connect_user(
+    rpc: &FiberRpc,
+    config: &Config,
+    pubkey: &str,
+    address: &str,
+) -> Result<ConnectResult, String> {
+    let pubkey = pubkey.trim();
+    let address = address.trim();
+    if pubkey.is_empty() {
+        return Err("pubkey is required".into());
+    }
+    if address.is_empty() {
+        return Err("address is required".into());
+    }
+
+    match rpc
+        .call(
+            &config.twine_rpc,
+            "connect_peer",
+            json!([{
+                "pubkey": pubkey,
+                "address": address,
+                "save": true,
+            }]),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) if already_connected(&err) => {}
+        Err(err) => return Err(err),
+    }
+
+    let listed = rpc
+        .call(&config.twine_rpc, "list_channels", json!([{}]))
+        .await?;
+    if let Some(channel) = channel_for_peer(&listed, pubkey)? {
+        let channel_id = json_string(channel.get("channel_id"));
+        let ready = channel
+            .get("state")
+            .and_then(|state| state.get("state_name"))
+            .and_then(Value::as_str)
+            .is_some_and(is_ready_state);
+        return Ok(ConnectResult {
+            connected: true,
+            channel_open: ready,
+            channel_id,
+            message: if ready {
+                "Twine already has a ready channel to this node".into()
+            } else {
+                "Twine is already opening a channel to this node".into()
+            },
+        });
+    }
+
+    rpc.call(
+        &config.twine_rpc,
+        "open_channel",
+        json!([{
+            "pubkey": pubkey,
+            "funding_amount": format!("0x{:x}", config.funding_shannons),
+            "public": true,
+        }]),
+    )
+    .await?;
+
+    let listed = rpc
+        .call(&config.twine_rpc, "list_channels", json!([{}]))
+        .await
+        .ok();
+    let channel_id = listed
+        .as_ref()
+        .and_then(|value| channel_for_peer(value, pubkey).ok().flatten())
+        .and_then(|channel| json_string(channel.get("channel_id")));
+
+    Ok(ConnectResult {
+        connected: true,
+        channel_open: true,
+        channel_id,
+        message: "Twine connected and opened a channel toward this node".into(),
+    })
+}
+
+fn already_connected(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("already") || lower.contains("connected")
 }
 
 fn node_health(rpc_url: &str, info: Result<Value, String>) -> NodeHealth {
@@ -143,87 +213,6 @@ fn node_health(rpc_url: &str, info: Result<Value, String>) -> NodeHealth {
             node_name: None,
             error: Some(err),
         },
-    }
-}
-
-async fn channel_between(
-    rpc: &FiberRpc,
-    funder_rpc: &str,
-    funder: &'static str,
-    counterparty: &'static str,
-    funder_pubkey: Option<&str>,
-    counterparty_pubkey: Option<&str>,
-) -> ChannelHealth {
-    let Some(peer) = counterparty_pubkey else {
-        return empty_channel(
-            funder,
-            counterparty,
-            Some(format!("{counterparty} pubkey unavailable")),
-        );
-    };
-    if funder_pubkey.is_none() {
-        return empty_channel(
-            funder,
-            counterparty,
-            Some(format!("{funder} pubkey unavailable")),
-        );
-    }
-
-    let listed = rpc
-        .call(funder_rpc, "list_channels", serde_json::json!([{}]))
-        .await;
-    match listed {
-        Ok(value) => match channel_for_peer(&value, peer) {
-            Ok(Some(channel)) => channel_health(funder, counterparty, &channel),
-            Ok(None) => empty_channel(funder, counterparty, None),
-            Err(err) => empty_channel(funder, counterparty, Some(err)),
-        },
-        Err(err) => empty_channel(funder, counterparty, Some(err)),
-    }
-}
-
-fn empty_channel(
-    funder: &'static str,
-    counterparty: &'static str,
-    error: Option<String>,
-) -> ChannelHealth {
-    ChannelHealth {
-        funder,
-        counterparty,
-        open: false,
-        channel_id: None,
-        state: None,
-        local_balance: None,
-        remote_balance: None,
-        local_balance_ckb: None,
-        remote_balance_ckb: None,
-        error,
-    }
-}
-
-fn channel_health(
-    funder: &'static str,
-    counterparty: &'static str,
-    channel: &Value,
-) -> ChannelHealth {
-    let state = channel
-        .get("state")
-        .and_then(|state| state.get("state_name"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let local_balance = json_string(channel.get("local_balance"));
-    let remote_balance = json_string(channel.get("remote_balance"));
-    ChannelHealth {
-        funder,
-        counterparty,
-        open: state.as_deref().is_some_and(is_ready_state),
-        channel_id: json_string(channel.get("channel_id")),
-        state,
-        local_balance_ckb: local_balance.as_deref().and_then(format_ckb),
-        remote_balance_ckb: remote_balance.as_deref().and_then(format_ckb),
-        local_balance,
-        remote_balance,
-        error: None,
     }
 }
 
@@ -336,8 +325,5 @@ mod tests {
         });
         let channel = channel_for_peer(&list, "02aa").unwrap().unwrap();
         assert_eq!(channel["channel_id"], "0xready");
-        let health = channel_health("seller", "twine", &channel);
-        assert!(health.open);
-        assert_eq!(health.local_balance_ckb.as_deref(), Some("1.00000000"));
     }
 }

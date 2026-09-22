@@ -1,62 +1,64 @@
 # Twine Fiber POC
 
-A testnet proof of concept for a Fiber hold-invoice trade. One Flutter app is the client. One Rust daemon is the coordinator. Three Fiber nodes (seller, Twine, buyer) move real testnet CKB.
+A testnet proof of concept for a Fiber hold-invoice P2P market. One Flutter app is the client. One Rust daemon is the coordinator. Fiber nodes (any user, plus Twine) move real testnet CKB.
 
-The app never holds a Fiber key. Fiat is a button. The CKB movement is `new_invoice`, `send_payment`, `settle_invoice`, and TLC expiry on testnet (`Fibt`).
+A person is one Fiber node. Seller and buyer are which side of a trade that node is on. The app never holds a Fiber key. Fiat is a button. The CKB movement is `new_invoice`, `send_payment`, `settle_invoice`, and TLC expiry on testnet (`Fibt`).
 
 ```text
 twine-fiber-poc/
-  daemon/     Rust. HTTP API for the app. JSON-RPC to three fnn processes. Holds preimage S.
-  app/        Flutter. One screen. Role switch: Seller, Buyer, Solver.
-  scripts/    Download fnn, start the three testnet nodes, open the two channels.
+  daemon/     Rust. HTTP API for ads and trades. JSON-RPC only to the Twine fnn. Holds preimage S.
+  app/        Flutter. Market, post-ad, trade, and settings. Each phone talks to its own fnn.
+  scripts/    Download fnn, start the lab nodes, open channels.
 ```
 
-Node data, keys, the `fnn` binary, and `daemon/order.json` stay out of git.
+Node data, keys, the `fnn` binary, `daemon/order.json`, and `daemon/market.json` stay out of git.
 
 ## What a reviewer can do
 
-1. Create a sell order for a small amount of testnet CKB.
-2. Lock it in a Fiber hold invoice. The coins stay in the seller’s channel. Twine’s spendable balance does not increase.
-3. Mark fiat sent and release, or open a dispute.
-4. Watch one of the four endings on testnet.
+1. Open Settings, point the app at a Fiber RPC, and open both channel directions with Twine.
+2. Post a sell ad: CKB amount, fiat label, rate (fiat per 1 CKB), payment method.
+3. From a second node, pick that ad, enter a fiat amount, and start a trade. The daemon creates a hold invoice.
+4. Seller locks the hold from their own node. Buyer marks fiat sent and supplies a payout invoice. Seller releases.
+5. Watch one of the four endings on testnet.
 
 ```text
 [ Seller node ]              [ Twine daemon ]                    [ Buyer node ]
 
 1. Create hold invoice (H)          daemon calls twine fnn new_invoice
-2. Lock HTLC, status Received       seller fnn send_payment
-3. Order accepted                   buyer, in the app
-4. Fiat window                      a button. Off-chain. Three minutes in the app
-5. Fiat sent                        buyer, in the app
-6. Seller releases                  seller, in the app
+2. Lock HTLC, status Received       seller app send_payment on the seller fnn
+3. Fiat window                      starts when the hold is Received
+4. Fiat sent                        buyer app new_invoice, then a button
+5. Seller releases                  daemon pays the buyer invoice, then settle
 ```
 
 | Path | What they do | What Fiber does |
 | --- | --- | --- |
 | A | Buyer is reachable. Seller releases | Daemon pays the buyer’s invoice, then `settle_invoice(H, S)`. Invoice `Paid`. State `Settled` |
 | B | Payment to the buyer cannot route | `send_payment` fails. No `settle_invoice`. Hold stays `Received`. State `Leg2Failed`. A new invoice retries path A |
-| C | Either side disputes. Solver reads the chat | Buyer wins runs path A. If that payment fails, the order stays `Disputed` and is not settled. Seller wins leaves the hold `Received` until expiry |
+| C | Either side disputes. Operator reads the chat | Buyer wins runs path A. If that payment fails, the order stays `Disputed` and is not settled. Seller wins leaves the hold `Received` until expiry |
 | D | Nobody settles before the timelock | Fiber marks the invoice `Expired` and the seller is refunded. A later `settle_invoice` fails. `cancel_invoice` is not called |
 
-One order at a time. Create is allowed again when the order is `Idle`, `Cancelled`, `Paid`, `Settled`, or `Expired`.
+One open trade per ad. Creating a trade reserves CKB (`ckb = fiat / rate`). The reserved CKB returns to the ad if the trade is `Cancelled` or `Expired`. A `Settled` trade keeps the CKB subtracted.
 
 ## How the hold works
 
-The daemon generates preimage `S`, sets `H = SHA256(S)`, and creates the hold invoice with `payment_hash` and `hash_algorithm: sha256`. `payment_preimage` is omitted. `S` stays in `order.json` and is never returned by `GET /order`.
+The daemon generates preimage `S`, sets `H = SHA256(S)`, and creates the hold invoice with `payment_hash` and `hash_algorithm: sha256`. `payment_preimage` is omitted. `S` stays in `market.json` and is never returned by `GET /trades`.
 
-Currency is `Fibt`. The app amount is CKB. One CKB is `0x5f5e100` shannon. Use a small amount (1 CKB is enough).
+Currency is `Fibt`. Trade amounts are CKB. One CKB is `0x5f5e100` shannon. Use a small amount (1 CKB is enough).
+
+The seller app calls `send_payment` on the seller node. The buyer app calls `new_invoice` on the buyer node. The daemon talks only to Twine.
 
 | Moment | RPC | Invoice status |
 | --- | --- | --- |
 | Create hold | Twine `new_invoice` | `Open` |
-| Lock | Seller `send_payment` | `Received`. Coins are held in the seller’s channel |
+| Lock | Seller `send_payment` (from the app) | `Received`. Coins are held in the seller’s channel |
 | Unpaid cancel | `cancel_invoice` | `Cancelled`. Only legal while `Open` |
-| Path A | Twine `send_payment` to the buyer invoice, then `settle_invoice(H, S)` | `Paid` |
+| Path A | Twine `send_payment` to the stored buyer invoice, then `settle_invoice(H, S)` | `Paid` |
 | Path B | Buyer payment fails | stays `Received`. No `settle_invoice` |
 | Path C, seller wins | No `settle_invoice` | stays `Received` until expiry |
 | Path D | Nobody settles. `final_expiry_delta` passes | `Expired`. Seller payment returns |
 
-`cancel_invoice` on a `Received` invoice is refused. The app’s “Try cancel” button after lock only writes that to the log. Seller-wins and “buyer never returns” share path D’s refund: the TLC expires. The shortest `final_expiry_delta` Fiber accepts is 16 hours (`57_600_000` ms, `0x36ee800`). Every hold uses that. There is no virtual clock. The daemon polls `get_invoice` every 15 seconds; the app polls `GET /order` every 5 seconds while a hold can still expire.
+`cancel_invoice` on a `Received` invoice is refused. Seller-wins and “buyer never returns” share path D’s refund: the TLC expires. The shortest `final_expiry_delta` Fiber accepts is 16 hours (`57_600_000` ms, `0x36ee800`). Every hold uses that. There is no virtual clock. The daemon polls `get_invoice` every 15 seconds; the app polls `GET /trades/:id` every 5 seconds while a hold can still expire.
 
 Leg 2 comes first. The daemon calls `settle_invoice` only after `send_payment` to the buyer reports `Success`. Twine pays that invoice from its own outbound channel, because the seller’s coins are not spendable until settle.
 
@@ -74,7 +76,7 @@ Leg 2 comes first. The daemon calls `settle_invoice` only after `send_payment` t
 ./scripts/setup-nodes.sh
 ```
 
-That downloads `fnn` v0.9.1, writes a random node password to `nodes/password`, and prints a testnet address for seller, Twine, and buyer. Send CKB from [https://faucet.nervos.org](https://faucet.nervos.org) to all three before opening channels:
+That downloads `fnn` v0.9.1, writes a random node password to `nodes/password`, and prints a testnet address for seller, Twine, and buyer. Those three lab nodes are still the easiest two-user demo: treat “seller” and “buyer” as two people. Send CKB from [https://faucet.nervos.org](https://faucet.nervos.org) to all three before opening channels:
 
 | Node | Minimum | Why |
 | --- | --- | --- |
@@ -90,17 +92,21 @@ cd daemon && cargo run
 
 `start-nodes.sh` starts the three `fnn` processes and prints their RPC URLs and pubkeys. `open-channels.sh` connects them and opens seller → Twine and Twine → buyer, 500 CKB each (`FUNDING_SHANNONS` overrides the amount), then waits until both are `ChannelReady`.
 
+The Settings screen can do the same job without the script: **Open channel to Twine** funds that user’s outbound channel (needed to sell). **Ask Twine to open a return channel** calls `POST /connect` so Twine can pay them (needed to buy). Both directions are required.
+
 ```bash
 curl -s http://127.0.0.1:8080/health
 ```
 
-`ready` is true when all three pubkeys answer and both channels are open. Defaults are `SELLER_RPC=http://127.0.0.1:8227`, `TWINE_RPC=http://127.0.0.1:8237`, `BUYER_RPC=http://127.0.0.1:8247`. Start the daemon from `daemon/` so the order file is `daemon/order.json`.
+`ready` is true when the Twine node answers. Defaults are `TWINE_RPC=http://127.0.0.1:8237` and `TWINE_P2P=/ip4/127.0.0.1/tcp/8238`. Start the daemon from `daemon/` so the market file is `daemon/market.json`.
 
 ```bash
 cd app && flutter run
 ```
 
 On the iOS simulator the daemon URL is `http://127.0.0.1:8080`. On the Android emulator use `http://10.0.2.2:8080`. The app fills that in. A phone on the same network needs `LISTEN=0.0.0.0:8080` and the machine’s LAN address.
+
+Point one app at the seller RPC (`http://127.0.0.1:8227`, P2P `/ip4/127.0.0.1/tcp/8228`) and a second app at the buyer RPC (`http://127.0.0.1:8247`, P2P `/ip4/127.0.0.1/tcp/8248`).
 
 ```bash
 ./scripts/stop-nodes.sh
@@ -110,18 +116,16 @@ That stops the daemon (if `nodes/daemon.pid` exists) and the three nodes.
 
 ## Walk it in the app
 
-Switch role on the same screen. A second device pointed at the same daemon sees the same order.
+Settings stores the display name, this user’s `fnn` RPC, P2P address, and the Twine daemon URL. **Read node info** treats the Fiber pubkey as the user id. The same node can post an ad or take someone else’s.
 
-| Role | Actions |
+| Screen | Actions |
 | --- | --- |
-| Any | Create order → Demo cancel unpaid invoice → Create hold invoice |
-| Seller | Lock → Try cancel (skipped after Received) → Release |
-| Buyer | Accept (starts a 3 minute fiat timer) → Fiat sent |
-| Seller or Buyer | Open dispute, from `WaitingFiat`, `FiatSent`, or `Leg2Failed` → Post chat line |
-| Seller or Buyer, after path B | Retry with new invoice |
-| Solver | Award buyer / Award seller |
+| Market | Browse open ads. Buy starts a trade and creates the Twine hold |
+| Post ad | CKB for sale, fiat label, rate, payment method |
+| Trade | Seller: Lock, Release. Buyer: Fiat sent, Retry. Either side: dispute and chat |
+| Settings | Channel status. Open channel to Twine. Ask Twine for a return channel. Operator tools toggle |
 
-**Path A.** Buyer node stays up. Seller presses Release from `FiatSent`. The log lists the buyer payment, then settle, then `Settled`. The invoice shows `Paid`. Twine’s channel toward the buyer dips for the outbound payment and recovers on the seller channel when the hold settles.
+**Path A.** Buyer node stays up. Seller posts 1 CKB at 2000 NGN. Buyer takes 2000 NGN (locks 1 CKB). Seller presses Lock, buyer presses Fiat sent, seller presses Release. The log lists the buyer payment, then settle, then `Settled`. The invoice shows `Paid`.
 
 **Path B.** After Fiat sent, disconnect the buyer on the Fiber graph so Twine cannot route, then Release. State becomes `Leg2Failed`. The hold stays `Received`. The log has no `settle_invoice`. Reconnect the buyer and press Retry with new invoice. That retry is path A.
 
@@ -138,37 +142,41 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"connect_peer\",\"params\":[{\"pubkey\":\"$BUYER_PUB\",\"address\":\"/ip4/127.0.0.1/tcp/8248\",\"save\":true}]}"
 ```
 
-`TWINE_RELEASE_PAUSE_MS` (milliseconds) pauses the daemon after the buyer invoice is created and before `send_payment`, if you would rather stop the buyer process than disconnect the peer.
+`TWINE_RELEASE_PAUSE_MS` (milliseconds) pauses the daemon after it has the buyer invoice and before `send_payment`, if you would rather stop the buyer process than disconnect the peer.
 
-**Path C.** Open dispute while the hold is still `Received`. Both sides post a line. Switch to Solver. Award buyer runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. Award seller does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
+**Path C.** Open dispute while the hold is still `Received`. Both sides post a line. Turn on Operator tools in Settings. Award buyer runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. Award seller does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
 
-A seller-wins order stays open, so create is blocked until that hold expires. Run a buyer-wins trade first if you want both endings without waiting.
+A seller-wins trade stays open on that ad, so a second take is blocked until the hold expires.
 
-**Path D.** Lock a hold and do not settle it. Leave the daemon running. After 16 hours `get_invoice` is `Expired`, the order state is `Expired`, the seller’s channel balance is restored, and the log records a failed `settle_invoice` for that payment hash. It does not record a successful settle or a cancel.
+**Path D.** Lock a hold and do not settle it. Leave the daemon running. After 16 hours `get_invoice` is `Expired`, the trade state is `Expired`, the reserved CKB returns to the ad, and the log records a failed `settle_invoice` for that payment hash.
 
 ## HTTP API
 
-The daemon is the only process that talks to `fnn`. Bodies are JSON. Empty actions take `{}`.
+The daemon is the only process that talks to the Twine `fnn`. User nodes are called from the app. Bodies are JSON.
 
 | Method | Path | Body |
 | --- | --- | --- |
-| `GET` | `/health` | three pubkeys and both channel balances |
-| `GET` | `/order` | current order. Never includes `S` |
-| `POST` | `/order` | `{"amount":"1"}` |
-| `POST` | `/order/demo_cancel` | throwaway unpaid invoice, then `cancel_invoice` |
-| `POST` | `/order/hold` | hold invoice on the Twine node |
-| `POST` | `/order/lock` | seller `send_payment` |
-| `POST` | `/order/try_cancel` | refuses to cancel a `Received` hold |
-| `POST` | `/order/accept` | |
-| `POST` | `/order/fiat_sent` | |
-| `POST` | `/order/release` | path A, or `Leg2Failed` if the buyer payment fails |
-| `POST` | `/order/retry` | path A again, from `Leg2Failed` |
-| `POST` | `/order/dispute` | |
-| `POST` | `/order/chat` | `{"from":"buyer","text":"…"}` or `"from":"seller"` |
-| `POST` | `/order/award_buyer` | |
-| `POST` | `/order/award_seller` | |
+| `GET` | `/health` | Twine pubkey |
+| `GET` | `/twine` | Twine pubkey and P2P address |
+| `POST` | `/connect` | `{"pubkey":"…","address":"/ip4/…"}`. Twine `connect_peer` + `open_channel` |
+| `GET` | `/ads` | open ads with remaining CKB |
+| `POST` | `/ads` | `{"seller_pubkey","seller_name","available_ckb","fiat","rate","payment_method"}` |
+| `POST` | `/ads/:id/cancel` | |
+| `GET` | `/trades?pubkey=` | trades for that node |
+| `POST` | `/trades` | `{"ad_id","buyer_pubkey","buyer_name","fiat_amount"}`. Creates the hold |
+| `GET` | `/trades/:id` | current trade. Never includes `S` |
+| `POST` | `/trades/:id/demo_cancel` | throwaway unpaid invoice, then `cancel_invoice` |
+| `POST` | `/trades/:id/locked` | poll Twine until the hold is `Received`, then start the fiat window |
+| `POST` | `/trades/:id/try_cancel` | refuses to cancel a `Received` hold |
+| `POST` | `/trades/:id/fiat_sent` | `{"invoice":"…"}` buyer invoice from the buyer node |
+| `POST` | `/trades/:id/release` | path A, or `Leg2Failed` if the buyer payment fails |
+| `POST` | `/trades/:id/retry` | `{"invoice":"…"}` path A again, from `Leg2Failed` |
+| `POST` | `/trades/:id/dispute` | |
+| `POST` | `/trades/:id/chat` | `{"from":"buyer","text":"…"}` or `"from":"seller"` |
+| `POST` | `/trades/:id/award_buyer` | `{"invoice":"…"}` |
+| `POST` | `/trades/:id/award_seller` | |
 
-Errors are `{"error":"…"}` with 400 (bad amount or state), 409 (an order is already open), or 502 (Fiber).
+Errors are `{"error":"…"}` with 400 (bad amount or state), 404 (unknown ad or trade), 409 (an ad already has an open trade), or 502 (Fiber).
 
 Confirm a hold directly (replace `H`):
 
@@ -182,15 +190,15 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 | Variable | Default | |
 | --- | --- | --- |
 | `LISTEN` | `127.0.0.1:8080` | daemon bind address |
-| `SELLER_RPC` | `http://127.0.0.1:8227` | seller `fnn` |
 | `TWINE_RPC` | `http://127.0.0.1:8237` | Twine `fnn` |
-| `BUYER_RPC` | `http://127.0.0.1:8247` | buyer `fnn` |
-| `ORDER_FILE` | `order.json` in the working directory | persisted order, including `S` |
+| `TWINE_P2P` | `/ip4/127.0.0.1/tcp/8238` | Twine P2P address returned by `GET /twine` |
+| `MARKET_FILE` | `market.json` in the working directory | persisted ads and trades, including `S` |
+| `ORDER_FILE` | unused except to pick the directory for `market.json` | |
 | `TWINE_RELEASE_PAUSE_MS` | unset | pause before the buyer `send_payment` |
-| `FUNDING_SHANNONS` | `50000000000` (500 CKB) | channel funding in `open-channels.sh` |
+| `FUNDING_SHANNONS` | `50000000000` (500 CKB) | channel funding in `open-channels.sh` and `POST /connect` |
 
 P2P ports are seller `8228`, Twine `8238`, buyer `8248`.
 
 ## Out of scope
 
-Nostr, encrypted DMs, key rotation, bonds, fees, UDT, accounts, a public order book, and app-store builds. Dispute chat is plain text stored on the daemon.
+Nostr, encrypted DMs, key rotation, bonds, fees, UDT, accounts, buy-side ads, rate oracles, partial fills, and app-store builds. Dispute chat is plain text stored on the daemon. Pubkeys on ads and trades are not authenticated.

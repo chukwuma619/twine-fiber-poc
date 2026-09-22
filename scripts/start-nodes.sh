@@ -73,6 +73,7 @@ if [[ -f "$ADDRESSES_FILE" ]]; then
 fi
 
 echo
-echo "Daemon defaults: SELLER_RPC=$(rpc_url seller) TWINE_RPC=$(rpc_url twine) BUYER_RPC=$(rpc_url buyer)"
+echo "Daemon default: TWINE_RPC=$(rpc_url twine)"
+echo "App settings: one phone uses $(rpc_url seller) / $(p2p_addr seller); the other uses $(rpc_url buyer) / $(p2p_addr buyer)"
 echo "Start it with: cd daemon && cargo run"
 echo "Then: curl -s http://127.0.0.1:8080/health"

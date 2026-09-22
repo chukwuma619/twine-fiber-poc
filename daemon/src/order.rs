@@ -1,6 +1,3 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand::RngCore;
@@ -8,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::health::Config;
 use crate::rpc::FiberRpc;
 
 const SHANNONS_PER_CKB: u128 = 100_000_000;
@@ -25,17 +21,21 @@ pub const FINAL_EXPIRY_DELTA_MS: u64 = 57_600_000;
 /// How often the daemon polls Twine `get_invoice` for Path D expiry.
 pub const HOLD_EXPIRY_POLL: Duration = Duration::from_secs(15);
 
-#[derive(Clone, Debug)]
-pub struct OrderStore {
-    path: PathBuf,
-    inner: Arc<Mutex<Order>>,
-}
-
-/// Persisted order. `payment_preimage` stays on disk / in the daemon only.
+/// Persisted trade. `payment_preimage` stays on disk / in the daemon only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Order {
+pub struct Trade {
+    pub id: String,
+    pub ad_id: String,
+    pub seller_pubkey: String,
+    pub seller_name: String,
+    pub buyer_pubkey: String,
+    pub buyer_name: String,
+    pub fiat: String,
+    pub rate: String,
+    pub fiat_amount: String,
+    pub amount: String,
+    pub payment_method: String,
     pub state: OrderState,
-    pub amount: Option<String>,
     #[serde(default)]
     pub payment_hash: Option<String>,
     #[serde(default)]
@@ -44,47 +44,43 @@ pub struct Order {
     pub invoice_address: Option<String>,
     #[serde(default)]
     pub invoice_status: Option<String>,
-    /// Seller local balance on seller→twine while the hold is Received (payment in flight).
-    /// Used for Path D comparison after TLC expiry. Never returned in `OrderView`.
     #[serde(default)]
-    pub seller_local_while_held: Option<String>,
+    pub buyer_invoice: Option<String>,
     pub log: Vec<LogLine>,
     #[serde(default)]
     pub chat: Vec<ChatLine>,
 }
 
-/// Public order view. Never includes `payment_preimage`.
+/// Public trade view. Never includes `payment_preimage`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct OrderView {
+pub struct TradeView {
+    pub id: String,
+    pub ad_id: String,
+    pub seller_pubkey: String,
+    pub seller_name: String,
+    pub buyer_pubkey: String,
+    pub buyer_name: String,
+    pub fiat: String,
+    pub rate: String,
+    pub fiat_amount: String,
+    pub amount: String,
+    pub payment_method: String,
     pub state: OrderState,
-    pub amount: Option<String>,
     pub payment_hash: Option<String>,
     pub invoice_address: Option<String>,
     pub invoice_status: Option<String>,
+    pub buyer_invoice: Option<String>,
     pub log: Vec<LogLine>,
     pub chat: Vec<ChatLine>,
 }
 
-impl Order {
-    fn idle() -> Self {
-        Self {
-            state: OrderState::Idle,
-            amount: None,
-            payment_hash: None,
-            payment_preimage: None,
-            invoice_address: None,
-            invoice_status: None,
-            seller_local_while_held: None,
-            log: Vec::new(),
-            chat: Vec::new(),
-        }
-    }
-
+impl Trade {
     /// States where a Received hold may still expire on Fiber (Path D).
-    fn watches_hold_invoice(state: OrderState) -> bool {
+    pub fn watches_hold_invoice(state: OrderState) -> bool {
         matches!(
             state,
             OrderState::Held
+                | OrderState::WaitingHold
                 | OrderState::WaitingFiat
                 | OrderState::FiatSent
                 | OrderState::Leg2Failed
@@ -93,19 +89,30 @@ impl Order {
         )
     }
 
-    pub fn view(&self) -> OrderView {
-        OrderView {
-            state: self.state,
+    pub fn view(&self) -> TradeView {
+        TradeView {
+            id: self.id.clone(),
+            ad_id: self.ad_id.clone(),
+            seller_pubkey: self.seller_pubkey.clone(),
+            seller_name: self.seller_name.clone(),
+            buyer_pubkey: self.buyer_pubkey.clone(),
+            buyer_name: self.buyer_name.clone(),
+            fiat: self.fiat.clone(),
+            rate: self.rate.clone(),
+            fiat_amount: self.fiat_amount.clone(),
             amount: self.amount.clone(),
+            payment_method: self.payment_method.clone(),
+            state: self.state,
             payment_hash: self.payment_hash.clone(),
             invoice_address: self.invoice_address.clone(),
             invoice_status: self.invoice_status.clone(),
+            buyer_invoice: self.buyer_invoice.clone(),
             log: self.log.clone(),
             chat: self.chat.clone(),
         }
     }
 
-    fn is_open(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         !matches!(
             self.state,
             OrderState::Idle
@@ -116,7 +123,7 @@ impl Order {
         )
     }
 
-    fn push_log(&mut self, text: impl Into<String>) {
+    pub fn push_log(&mut self, text: impl Into<String>) {
         self.log.push(LogLine {
             at: timestamp(),
             text: text.into(),
@@ -161,9 +168,9 @@ pub struct PostChatBody {
     pub text: String,
 }
 
-/// How Path A payment failure updates order state.
+/// How Path A payment failure updates trade state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PayFailureMode {
+pub(crate) enum PayFailureMode {
     /// Stage 3/4: move to Leg2Failed.
     Leg2Failed,
     /// Stage 5 Path C buyer-wins: stay Disputed, do not settle.
@@ -174,909 +181,112 @@ enum PayFailureMode {
 pub enum OrderError {
     BadAmount(String),
     AlreadyOpen,
+    NotFound(String),
     BadState(String),
     Fiber(String),
     Save(String),
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateOrderBody {
-    pub amount: String,
+pub struct CreateAdBody {
+    pub seller_pubkey: String,
+    pub seller_name: String,
+    pub available_ckb: String,
+    pub fiat: Option<String>,
+    pub rate: String,
+    pub payment_method: String,
 }
 
-impl OrderStore {
-    pub fn from_env() -> Result<Self, String> {
-        let path = match std::env::var("ORDER_FILE") {
-            Ok(value) if !value.is_empty() => value,
-            _ => "order.json".to_string(),
-        };
-        Self::open(PathBuf::from(path))
-    }
+#[derive(Debug, Deserialize)]
+pub struct CreateTradeBody {
+    pub ad_id: String,
+    pub buyer_pubkey: String,
+    pub buyer_name: String,
+    pub fiat_amount: String,
+}
 
-    pub fn open(path: PathBuf) -> Result<Self, String> {
-        let order = if path.exists() {
-            let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-            serde_json::from_str(&text)
-                .map_err(|err| format!("order file {}: {err}", path.display()))?
-        } else {
-            Order::idle()
-        };
-        Ok(Self {
-            path,
-            inner: Arc::new(Mutex::new(order)),
-        })
-    }
+#[derive(Debug, Deserialize)]
+pub struct ConnectBody {
+    pub pubkey: String,
+    pub address: String,
+}
 
-    pub fn snapshot(&self) -> OrderView {
-        self.guard().view()
-    }
+#[derive(Debug, Deserialize)]
+pub struct BuyerInvoiceBody {
+    pub invoice: String,
+}
 
-    pub fn create(&self, amount: &str) -> Result<OrderView, OrderError> {
-        let amount = normalize_amount(amount).map_err(OrderError::BadAmount)?;
-        let mut order = self.guard();
-        if order.is_open() {
-            return Err(OrderError::AlreadyOpen);
-        }
-        *order = Order {
-            state: OrderState::Pending,
-            amount: Some(amount.clone()),
-            payment_hash: None,
-            payment_preimage: None,
-            invoice_address: None,
-            invoice_status: None,
-            seller_local_while_held: None,
-            log: vec![LogLine {
-                at: timestamp(),
-                text: format!("created order for {amount} CKB"),
-            }],
-            chat: Vec::new(),
-        };
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("order created amount={amount} CKB state=Pending");
-        Ok(order.view())
-    }
-
-    /// Create a throwaway Open invoice and cancel it. Does not change the live order state.
-    pub async fn demo_cancel(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let amount = {
-            let order = self.guard();
-            order
-                .amount
-                .clone()
-                .ok_or_else(|| OrderError::BadState("create an order first".into()))?
-        };
-        let shannon = amount_to_shannon(&amount).map_err(OrderError::BadAmount)?;
-        let (_s, payment_hash) = generate_preimage();
-        let created = rpc
-            .call(
-                &config.twine_rpc,
-                "new_invoice",
-                json!([{
-                    "amount": hex_u128(shannon),
-                    "currency": "Fibt",
-                    "description": "twine demo cancel",
-                    "payment_hash": payment_hash,
-                    "hash_algorithm": "sha256",
-                }]),
-            )
-            .await
-            .map_err(OrderError::Fiber)?;
-        let address = invoice_address(&created).unwrap_or_default();
-        let cancelled = rpc
-            .call(
-                &config.twine_rpc,
-                "cancel_invoice",
-                json!([{ "payment_hash": payment_hash }]),
-            )
-            .await
-            .map_err(OrderError::Fiber)?;
-        let status = invoice_status(&cancelled).unwrap_or_else(|| "Cancelled".into());
-
-        let mut order = self.guard();
-        let live_state = order.state;
-        order.push_log(format!(
-            "demo cancel: unpaid invoice {status} H={payment_hash} (live order unchanged, still {live_state:?})"
-        ));
-        if !address.is_empty() {
-            order.push_log(format!("demo cancel invoice was {address}"));
-        }
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("demo cancel H={payment_hash} status={status}");
-        Ok(order.view())
-    }
-
-    pub async fn create_hold(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let (amount, state) = {
-            let order = self.guard();
-            (order.amount.clone(), order.state)
-        };
-        if state != OrderState::Pending {
-            return Err(OrderError::BadState(format!(
-                "create hold needs Pending, got {state:?}"
-            )));
-        }
-        let amount = amount.ok_or_else(|| OrderError::BadState("order has no amount".into()))?;
-        let shannon = amount_to_shannon(&amount).map_err(OrderError::BadAmount)?;
-        let (preimage, payment_hash) = generate_preimage();
-
-        let created = rpc
-            .call(
-                &config.twine_rpc,
-                "new_invoice",
-                json!([{
-                    "amount": hex_u128(shannon),
-                    "currency": "Fibt",
-                    "description": format!("twine order {amount} CKB"),
-                    "payment_hash": payment_hash,
-                    "hash_algorithm": "sha256",
-                    "final_expiry_delta": hex_u64(FINAL_EXPIRY_DELTA_MS),
-                }]),
-            )
-            .await
-            .map_err(OrderError::Fiber)?;
-        let address = invoice_address(&created)
-            .ok_or_else(|| OrderError::Fiber("new_invoice missing invoice_address".into()))?;
-        let status = invoice_status(&created).unwrap_or_else(|| "Open".into());
-        let attr_delta = invoice_final_expiry_delta(&created);
-        if let Some(attr) = attr_delta.as_deref() {
-            let expected = hex_u64(FINAL_EXPIRY_DELTA_MS);
-            if normalize_hex(attr) != normalize_hex(&expected) {
-                return Err(OrderError::Fiber(format!(
-                    "new_invoice final_htlc_minimum_expiry_delta={attr} did not match requested {expected}"
-                )));
-            }
-        }
-
-        let mut order = self.guard();
-        if order.state != OrderState::Pending {
-            return Err(OrderError::BadState(
-                "order changed while creating hold".into(),
-            ));
-        }
-        order.state = OrderState::WaitingHold;
-        order.payment_hash = Some(payment_hash.clone());
-        order.payment_preimage = Some(preimage);
-        order.invoice_address = Some(address.clone());
-        order.invoice_status = Some(status.clone());
-        order.push_log(format!(
-            "hold invoice created H={payment_hash} final_expiry_delta={FINAL_EXPIRY_DELTA_MS}ms ({}) S sealed in daemon (never sent to app)",
-            hex_u64(FINAL_EXPIRY_DELTA_MS)
-        ));
-        order.push_log(format!("invoice address {address}"));
-        order.push_log(format!("invoice status {status}"));
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!(
-            "hold created H={payment_hash} final_expiry_delta={FINAL_EXPIRY_DELTA_MS}ms state=WaitingHold S sealed"
-        );
-        Ok(order.view())
-    }
-
-    pub async fn lock_payment(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let (state, address, payment_hash) = {
-            let order = self.guard();
-            (
-                order.state,
-                order.invoice_address.clone(),
-                order.payment_hash.clone(),
-            )
-        };
-        if state != OrderState::WaitingHold {
-            return Err(OrderError::BadState(format!(
-                "lock needs WaitingHold, got {state:?}"
-            )));
-        }
-        let address =
-            address.ok_or_else(|| OrderError::BadState("missing invoice address".into()))?;
-        let payment_hash =
-            payment_hash.ok_or_else(|| OrderError::BadState("missing payment hash".into()))?;
-
-        rpc.call(
-            &config.seller_rpc,
-            "send_payment",
+pub(crate) async fn create_hold_invoice(
+    rpc: &FiberRpc,
+    twine_rpc: &str,
+    amount: &str,
+) -> Result<(String, String, String, String), OrderError> {
+    let shannon = amount_to_shannon(amount).map_err(OrderError::BadAmount)?;
+    let (preimage, payment_hash) = generate_preimage();
+    let created = rpc
+        .call(
+            twine_rpc,
+            "new_invoice",
             json!([{
-                "invoice": address,
-                "max_fee_amount": "0x5f5e100",
+                "amount": hex_u128(shannon),
+                "currency": "Fibt",
+                "description": format!("twine order {amount} CKB"),
+                "payment_hash": payment_hash,
+                "hash_algorithm": "sha256",
+                "final_expiry_delta": hex_u64(FINAL_EXPIRY_DELTA_MS),
             }]),
         )
         .await
         .map_err(OrderError::Fiber)?;
-
-        let status = poll_invoice_received(rpc, &config.twine_rpc, &payment_hash).await?;
-        let seller_local = seller_local_balance(rpc, config).await.ok();
-
-        let mut order = self.guard();
-        if order.state != OrderState::WaitingHold {
-            return Err(OrderError::BadState(
-                "order changed while locking".into(),
-            ));
-        }
-        order.state = OrderState::Held;
-        order.invoice_status = Some(status.clone());
-        if let Some(local) = seller_local.clone() {
-            order.seller_local_while_held = Some(local);
-        }
-        order.push_log(format!(
-            "seller locked: send_payment submitted, get_invoice={status}"
-        ));
-        order.push_log(format!(
-            "H={payment_hash} S still sealed in daemon; Twine spendable balance unchanged until settle"
-        ));
-        if let Some(local) = seller_local {
-            order.push_log(format!(
-                "seller→twine local while payment in flight={local}"
-            ));
-        }
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("locked H={payment_hash} invoice={status} state=Held");
-        Ok(order.view())
-    }
-
-    /// After Received, do not call cancel_invoice on the live hold — it would destroy
-    /// the trade. Fiber docs say cancel is only legal while Open; we refuse locally.
-    pub async fn try_cancel(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let (state, payment_hash) = {
-            let order = self.guard();
-            (order.state, order.payment_hash.clone())
-        };
-        let payment_hash =
-            payment_hash.ok_or_else(|| OrderError::BadState("no hold invoice yet".into()))?;
-
-        let current = rpc
-            .call(
-                &config.twine_rpc,
-                "get_invoice",
-                json!([{ "payment_hash": payment_hash }]),
-            )
-            .await
-            .map_err(OrderError::Fiber)?;
-        let status = invoice_status(&current).unwrap_or_else(|| "unknown".into());
-
-        if status != "Open" {
-            let mut order = self.guard();
-            order.invoice_status = Some(status.clone());
-            order.push_log(format!(
-                "cancel_invoice not applied (state={state:?}, invoice={status}): only legal while Open; after Received the seller refund is TLC expiry, not cancel"
-            ));
-            save(&self.path, &order).map_err(OrderError::Save)?;
-            return Ok(order.view());
-        }
-
-        match rpc
-            .call(
-                &config.twine_rpc,
-                "cancel_invoice",
-                json!([{ "payment_hash": payment_hash }]),
-            )
-            .await
-        {
-            Ok(result) => {
-                let status = invoice_status(&result).unwrap_or_else(|| "Cancelled".into());
-                let mut order = self.guard();
-                order.state = OrderState::Cancelled;
-                order.invoice_status = Some(status.clone());
-                order.push_log(format!(
-                    "cancel_invoice succeeded: invoice {status} H={payment_hash}"
-                ));
-                save(&self.path, &order).map_err(OrderError::Save)?;
-                Ok(order.view())
-            }
-            Err(err) => {
-                let mut order = self.guard();
-                order.push_log(format!(
-                    "cancel_invoice refused (state={state:?}, invoice={status}): {err}"
-                ));
-                save(&self.path, &order).map_err(OrderError::Save)?;
-                Ok(order.view())
-            }
-        }
-    }
-
-    pub fn accept(&self) -> Result<OrderView, OrderError> {
-        let mut order = self.guard();
-        if order.state != OrderState::Held {
-            return Err(OrderError::BadState(format!(
-                "accept needs Held, got {:?}",
-                order.state
+    let address = invoice_address(&created)
+        .ok_or_else(|| OrderError::Fiber("new_invoice missing invoice_address".into()))?;
+    let status = invoice_status(&created).unwrap_or_else(|| "Open".into());
+    if let Some(attr) = invoice_final_expiry_delta(&created) {
+        let expected = hex_u64(FINAL_EXPIRY_DELTA_MS);
+        if normalize_hex(&attr) != normalize_hex(&expected) {
+            return Err(OrderError::Fiber(format!(
+                "new_invoice final_htlc_minimum_expiry_delta={attr} did not match requested {expected}"
             )));
         }
-        order.state = OrderState::WaitingFiat;
-        order.push_log("buyer accepted; start fiat timer in the app");
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("state=WaitingFiat");
-        Ok(order.view())
     }
+    Ok((preimage, payment_hash, address, status))
+}
 
-    pub fn fiat_sent(&self) -> Result<OrderView, OrderError> {
-        let mut order = self.guard();
-        if order.state != OrderState::WaitingFiat {
-            return Err(OrderError::BadState(format!(
-                "fiat sent needs WaitingFiat, got {:?}",
-                order.state
-            )));
-        }
-        order.state = OrderState::FiatSent;
-        order.push_log("buyer marked fiat sent");
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("state=FiatSent");
-        Ok(order.view())
-    }
-
-    /// Stage 3 Path A / Stage 4 Path B: pay buyer from Twine, then settle_invoice(H, S).
-    /// Accepts FiatSent or Releasing so a stage-2 order can continue.
-    /// On buyer payment failure → Leg2Failed (no settle, no auto-retry).
-    pub async fn release(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let state = self.guard().state;
-        if state != OrderState::FiatSent && state != OrderState::Releasing {
-            return Err(OrderError::BadState(format!(
-                "release needs FiatSent or Releasing, got {state:?}"
-            )));
-        }
-
-        {
-            let mut order = self.guard();
-            if order.state == OrderState::FiatSent {
-                order.state = OrderState::Releasing;
-                order.push_log("seller released; path A: pay buyer then settle hold");
-                save(&self.path, &order).map_err(OrderError::Save)?;
-                eprintln!("state=Releasing (path A)");
-            } else {
-                order.push_log("path A continue from Releasing: pay buyer then settle hold");
-                save(&self.path, &order).map_err(OrderError::Save)?;
-            }
-        }
-
-        self.pay_buyer_then_settle(rpc, config, PayFailureMode::Leg2Failed)
-            .await
-    }
-
-    /// Stage 4 Path B retry: from Leg2Failed, create a new buyer invoice and run path A.
-    pub async fn retry(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let state = self.guard().state;
-        if state != OrderState::Leg2Failed {
-            return Err(OrderError::BadState(format!(
-                "retry needs Leg2Failed, got {state:?}"
-            )));
-        }
-
-        {
-            let mut order = self.guard();
-            order.state = OrderState::Releasing;
-            order.push_log(
-                "retry: buyer submitted a new invoice path; path A: pay buyer then settle hold",
-            );
-            save(&self.path, &order).map_err(OrderError::Save)?;
-            eprintln!("state=Releasing (path B retry → path A)");
-        }
-
-        self.pay_buyer_then_settle(rpc, config, PayFailureMode::Leg2Failed)
-            .await
-    }
-
-    /// Stage 5 Path C: open a dispute from WaitingFiat / FiatSent / Leg2Failed while hold is Received.
-    pub async fn open_dispute(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let (state, payment_hash) = {
-            let order = self.guard();
-            (order.state, order.payment_hash.clone())
-        };
-        match state {
-            OrderState::WaitingFiat | OrderState::FiatSent | OrderState::Leg2Failed => {}
-            other => {
-                return Err(OrderError::BadState(format!(
-                    "open dispute needs WaitingFiat, FiatSent, or Leg2Failed, got {other:?}"
-                )));
-            }
-        }
-        let payment_hash =
-            payment_hash.ok_or_else(|| OrderError::BadState("missing hold payment hash".into()))?;
-
-        let status = fetch_invoice_status(rpc, &config.twine_rpc, &payment_hash).await?;
-        require_received_for_dispute(&status)?;
-
-        let mut order = self.guard();
-        match order.state {
-            OrderState::WaitingFiat | OrderState::FiatSent | OrderState::Leg2Failed => {}
-            other => {
-                return Err(OrderError::BadState(format!(
-                    "order changed while opening dispute, got {other:?}"
-                )));
-            }
-        }
-        order.state = OrderState::Disputed;
-        order.invoice_status = Some(status.clone());
-        order.push_log(format!(
-            "dispute opened (invoice still {status}); chat is plain text on the daemon"
-        ));
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("state=Disputed H={payment_hash}");
-        Ok(order.view())
-    }
-
-    /// Stage 5 Path C: post a plain-text chat line while Disputed.
-    pub fn post_chat(&self, body: &PostChatBody) -> Result<OrderView, OrderError> {
-        let from = body.from.trim().to_ascii_lowercase();
-        if from != "buyer" && from != "seller" {
-            return Err(OrderError::BadState(
-                "chat from must be buyer or seller".into(),
-            ));
-        }
-        let text = body.text.trim();
-        if text.is_empty() {
-            return Err(OrderError::BadState("chat text is required".into()));
-        }
-        if text.len() > 500 {
-            return Err(OrderError::BadState(
-                "chat text must be at most 500 characters".into(),
-            ));
-        }
-
-        let mut order = self.guard();
-        if order.state != OrderState::Disputed {
-            return Err(OrderError::BadState(format!(
-                "post chat needs Disputed, got {:?}",
-                order.state
-            )));
-        }
-        order.chat.push(ChatLine {
-            at: timestamp(),
-            from: from.clone(),
-            text: text.to_string(),
-        });
-        order.push_log(format!("chat ({from}): {text}"));
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        Ok(order.view())
-    }
-
-    /// Stage 5 Path C buyer wins: same pay+settle as Path A. Route fail → stay Disputed.
-    pub async fn award_buyer(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let (state, payment_hash) = {
-            let order = self.guard();
-            (order.state, order.payment_hash.clone())
-        };
-        if state != OrderState::Disputed {
-            return Err(OrderError::BadState(format!(
-                "award buyer needs Disputed, got {state:?}"
-            )));
-        }
-        let payment_hash =
-            payment_hash.ok_or_else(|| OrderError::BadState("missing hold payment hash".into()))?;
-
-        let status = fetch_invoice_status(rpc, &config.twine_rpc, &payment_hash).await?;
-        require_received_for_award(&status)?;
-
-        {
-            let mut order = self.guard();
-            if order.state != OrderState::Disputed {
-                return Err(OrderError::BadState(
-                    "order changed while awarding buyer".into(),
-                ));
-            }
-            order.invoice_status = Some(status);
-            order.push_log(
-                "solver awarded buyer; path C → path A: pay buyer then settle hold",
-            );
-            save(&self.path, &order).map_err(OrderError::Save)?;
-            eprintln!("path C award buyer H={payment_hash}");
-        }
-
-        self.pay_buyer_then_settle(rpc, config, PayFailureMode::StayDisputed)
-            .await
-    }
-
-    /// Stage 5 Path C seller wins: do not settle or cancel. Hold stays Received until TLC expiry.
-    pub async fn award_seller(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<OrderView, OrderError> {
-        let (state, payment_hash) = {
-            let order = self.guard();
-            (order.state, order.payment_hash.clone())
-        };
-        if state != OrderState::Disputed {
-            return Err(OrderError::BadState(format!(
-                "award seller needs Disputed, got {state:?}"
-            )));
-        }
-        let payment_hash =
-            payment_hash.ok_or_else(|| OrderError::BadState("missing hold payment hash".into()))?;
-
-        let status = fetch_invoice_status(rpc, &config.twine_rpc, &payment_hash).await?;
-        require_received_for_award(&status)?;
-
-        let mut order = self.guard();
-        if order.state != OrderState::Disputed {
-            return Err(OrderError::BadState(
-                "order changed while awarding seller".into(),
-            ));
-        }
-        order.invoice_status = Some(status.clone());
-        order.push_log(format!(
-            "solver awarded seller: hold stays {status}; settle_invoice not called; cancel_invoice not called; seller refund at TLC expiry"
-        ));
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!(
-            "path C award seller H={payment_hash} invoice={status} (no settle, no cancel)"
-        );
-        Ok(order.view())
-    }
-
-    /// Shared Path A payment + settle. Payment failure disposition depends on mode.
-    async fn pay_buyer_then_settle(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-        on_failure: PayFailureMode,
-    ) -> Result<OrderView, OrderError> {
-        let (amount, hold_hash, hold_preimage) = {
-            let order = self.guard();
-            (
-                order.amount.clone(),
-                order.payment_hash.clone(),
-                order.payment_preimage.clone(),
-            )
-        };
-        let amount = amount.ok_or_else(|| OrderError::BadState("order has no amount".into()))?;
-        let hold_hash =
-            hold_hash.ok_or_else(|| OrderError::BadState("missing hold payment hash".into()))?;
-        let hold_preimage = hold_preimage
-            .ok_or_else(|| OrderError::BadState("missing hold payment preimage".into()))?;
-        let shannon = amount_to_shannon(&amount).map_err(OrderError::BadAmount)?;
-
-        let buyer_invoice = rpc
-            .call(
-                &config.buyer_rpc,
-                "new_invoice",
-                json!([{
-                    "amount": hex_u128(shannon),
-                    "currency": "Fibt",
-                    "description": format!("twine path A buyer {amount} CKB"),
-                    "hash_algorithm": "sha256",
-                }]),
-            )
-            .await
-            .map_err(OrderError::Fiber)?;
-        let buyer_address = invoice_address(&buyer_invoice).ok_or_else(|| {
-            OrderError::Fiber("buyer new_invoice missing invoice_address".into())
-        })?;
-        let buyer_payment_hash = invoice_payment_hash(&buyer_invoice).ok_or_else(|| {
-            OrderError::Fiber("buyer new_invoice missing payment_hash".into())
-        })?;
-
-        {
-            let mut order = self.guard();
-            order.push_log(format!(
-                "pay: buyer invoice created H={buyer_payment_hash} (normal invoice, preimage on buyer node)"
-            ));
-            save(&self.path, &order).map_err(OrderError::Save)?;
-        }
-
-        // Optional pause so a Path B demo can stop the buyer node after new_invoice
-        // and before send_payment (TWINE_RELEASE_PAUSE_MS, e.g. 3000).
-        if let Ok(raw) = std::env::var("TWINE_RELEASE_PAUSE_MS") {
-            if let Ok(ms) = raw.parse::<u64>() {
-                if ms > 0 {
-                    eprintln!("TWINE_RELEASE_PAUSE_MS={ms}: pausing before send_payment");
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                }
-            }
-        }
-
-        let sent = match rpc
-            .call(
-                &config.twine_rpc,
-                "send_payment",
-                json!([{
-                    "invoice": buyer_address,
-                    "max_fee_amount": "0x5f5e100",
-                }]),
-            )
-            .await
-        {
-            Ok(sent) => sent,
-            Err(err) => {
-                return self.record_pay_failure(
-                    format!("send_payment failed: {err}"),
-                    on_failure,
-                );
-            }
-        };
-        let pay_hash = payment_hash_of(&sent).unwrap_or(buyer_payment_hash.clone());
-
-        {
-            let mut order = self.guard();
-            order.push_log(format!(
-                "pay: twine send_payment submitted payment_hash={pay_hash}"
-            ));
-            save(&self.path, &order).map_err(OrderError::Save)?;
-        }
-
-        match poll_payment_done(rpc, &config.twine_rpc, &pay_hash).await {
-            Ok(status) => {
-                let mut order = self.guard();
-                order.push_log(format!("pay: get_payment={status}"));
-                save(&self.path, &order).map_err(OrderError::Save)?;
-            }
-            Err(err) => {
-                let detail = match &err {
-                    OrderError::Fiber(message) => message.clone(),
-                    other => format!("{other:?}"),
-                };
-                return self.record_pay_failure(detail, on_failure);
-            }
-        }
-
-        rpc.call(
-            &config.twine_rpc,
-            "settle_invoice",
+pub(crate) async fn demo_cancel_invoice(
+    rpc: &FiberRpc,
+    twine_rpc: &str,
+    amount: &str,
+) -> Result<(String, String, String), OrderError> {
+    let shannon = amount_to_shannon(amount).map_err(OrderError::BadAmount)?;
+    let (_s, payment_hash) = generate_preimage();
+    let created = rpc
+        .call(
+            twine_rpc,
+            "new_invoice",
             json!([{
-                "payment_hash": hold_hash,
-                "payment_preimage": hold_preimage,
+                "amount": hex_u128(shannon),
+                "currency": "Fibt",
+                "description": "twine demo cancel",
+                "payment_hash": payment_hash,
+                "hash_algorithm": "sha256",
             }]),
         )
         .await
         .map_err(OrderError::Fiber)?;
-
-        {
-            let mut order = self.guard();
-            order.push_log("settle: settle_invoice(H, S) submitted on twine");
-            save(&self.path, &order).map_err(OrderError::Save)?;
-        }
-
-        let status = poll_invoice_paid(rpc, &config.twine_rpc, &hold_hash).await?;
-
-        let mut order = self.guard();
-        order.state = OrderState::Settled;
-        order.invoice_status = Some(status.clone());
-        order.push_log(format!("settle: hold invoice={status}"));
-        order.push_log(match on_failure {
-            PayFailureMode::Leg2Failed => "path A complete: state Settled".to_string(),
-            PayFailureMode::StayDisputed => {
-                "path C buyer wins complete: state Settled".to_string()
-            }
-        });
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("settled H={hold_hash} invoice={status} state=Settled");
-        Ok(order.view())
-    }
-
-    /// Path B / Path C payment failure. Hold untouched; do not cancel_invoice.
-    fn record_pay_failure(
-        &self,
-        detail: String,
-        mode: PayFailureMode,
-    ) -> Result<OrderView, OrderError> {
-        match mode {
-            PayFailureMode::Leg2Failed => self.record_leg2_failed(detail),
-            PayFailureMode::StayDisputed => self.record_award_buyer_failed(detail),
-        }
-    }
-
-    /// Path B: payment to buyer failed. Hold untouched; do not cancel_invoice.
-    /// Returns Ok so the client observes Leg2Failed before any separate retry.
-    fn record_leg2_failed(&self, detail: String) -> Result<OrderView, OrderError> {
-        let mut order = self.guard();
-        order.state = OrderState::Leg2Failed;
-        order.push_log(format!(
-            "pay failed: {detail}; settle_invoice not called (hold stays Received)"
-        ));
-        order.push_log(
-            "path B: buyer should submit a new invoice to retry (POST /order/retry)",
-        );
-        order.push_log(
-            "if the buyer never returns, the seller is refunded when the TLC expires (do not cancel_invoice on Received)",
-        );
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("path B Leg2Failed: {detail}");
-        Ok(order.view())
-    }
-
-    /// Path C buyer-wins payment failed: stay Disputed, do not settle.
-    fn record_award_buyer_failed(&self, detail: String) -> Result<OrderView, OrderError> {
-        let mut order = self.guard();
-        order.state = OrderState::Disputed;
-        order.push_log(format!(
-            "path C buyer award pay failed: {detail}; settle_invoice not called; stay Disputed (hold stays Received)"
-        ));
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!("path C award buyer failed, stay Disputed: {detail}");
-        Ok(order.view())
-    }
-
-    /// Stage 6 Path D: one poll of Twine `get_invoice`. When Fiber marks the hold
-    /// `Expired`, move to `Expired`, log the seller refund, attempt one failing
-    /// `settle_invoice`, and record seller channel balances. Never calls `cancel_invoice`.
-    pub async fn poll_hold_expiry(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-    ) -> Result<Option<OrderView>, OrderError> {
-        let (state, payment_hash, already_expired) = {
-            let order = self.guard();
-            (
-                order.state,
-                order.payment_hash.clone(),
-                order.state == OrderState::Expired,
-            )
-        };
-        if already_expired || !Order::watches_hold_invoice(state) {
-            return Ok(None);
-        }
-        let payment_hash = match payment_hash {
-            Some(hash) => hash,
-            None => return Ok(None),
-        };
-
-        let current = rpc
-            .call(
-                &config.twine_rpc,
-                "get_invoice",
-                json!([{ "payment_hash": payment_hash }]),
-            )
-            .await
-            .map_err(OrderError::Fiber)?;
-        let status = invoice_status(&current).unwrap_or_else(|| "unknown".into());
-
-        if status == "Received" {
-            let seller_local = seller_local_balance(rpc, config).await.ok();
-            let mut order = self.guard();
-            if !Order::watches_hold_invoice(order.state) {
-                return Ok(None);
-            }
-            order.invoice_status = Some(status);
-            if let Some(local) = seller_local {
-                order.seller_local_while_held = Some(local);
-            }
-            save(&self.path, &order).map_err(OrderError::Save)?;
-            return Ok(None);
-        }
-
-        if status != "Expired" {
-            let mut order = self.guard();
-            if Order::watches_hold_invoice(order.state) {
-                order.invoice_status = Some(status);
-                save(&self.path, &order).map_err(OrderError::Save)?;
-            }
-            return Ok(None);
-        }
-
-        self.apply_path_d_expiry(rpc, config, &payment_hash)
-            .await
-            .map(Some)
-    }
-
-    async fn apply_path_d_expiry(
-        &self,
-        rpc: &FiberRpc,
-        config: &Config,
-        payment_hash: &str,
-    ) -> Result<OrderView, OrderError> {
-        let (preimage, in_flight) = {
-            let order = self.guard();
-            (
-                order.payment_preimage.clone(),
-                order.seller_local_while_held.clone(),
-            )
-        };
-
-        // Attempt settle once so acceptance can show it fails after expiry.
-        // A failed settle is not a successful settle; do not call cancel_invoice.
-        let settle_err = match preimage {
-            Some(preimage) => match rpc
-                .call(
-                    &config.twine_rpc,
-                    "settle_invoice",
-                    json!([{
-                        "payment_hash": payment_hash,
-                        "payment_preimage": preimage,
-                    }]),
-                )
-                .await
-            {
-                Ok(_) => Some(
-                    "settle_invoice returned ok after Expired (unexpected; not treated as Path A settle)"
-                        .to_string(),
-                ),
-                Err(err) => Some(err),
-            },
-            None => Some("missing sealed preimage S; settle_invoice not attempted".into()),
-        };
-
-        // Give the channel a moment to restore local balance after TLC expiry.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let after = seller_local_balance(rpc, config).await.ok();
-
-        let mut order = self.guard();
-        if order.state == OrderState::Expired {
-            return Ok(order.view());
-        }
-        if !Order::watches_hold_invoice(order.state) {
-            return Err(OrderError::BadState(format!(
-                "path D expiry interrupted; order is {:?}",
-                order.state
-            )));
-        }
-        order.state = OrderState::Expired;
-        order.invoice_status = Some("Expired".into());
-        order.push_log(format!(
-            "path D: hold invoice Expired H={payment_hash}; seller payment failed back; seller refunded because the TLC expired"
-        ));
-        order.push_log(
-            "path D: cancel_invoice not called (not legal / not needed after Received→Expired)",
-        );
-        if let Some(err) = settle_err {
-            order.push_log(format!(
-                "path D: settle_invoice(H, S) after expiry failed as expected: {err} (not a successful settle)"
-            ));
-        }
-        match (&in_flight, &after) {
-            (Some(before), Some(after_bal)) => {
-                order.push_log(format!(
-                    "path D: seller→twine local while payment in flight={before}; after expiry={after_bal}"
-                ));
-            }
-            (Some(before), None) => {
-                order.push_log(format!(
-                    "path D: seller→twine local while payment in flight={before}; after expiry unavailable"
-                ));
-            }
-            (None, Some(after_bal)) => {
-                order.push_log(format!(
-                    "path D: seller→twine local while in flight unavailable; after expiry={after_bal}"
-                ));
-            }
-            (None, None) => {
-                order.push_log(
-                    "path D: seller→twine local balances unavailable around expiry",
-                );
-            }
-        }
-        save(&self.path, &order).map_err(OrderError::Save)?;
-        eprintln!(
-            "path D Expired H={payment_hash} (seller refunded at TLC expiry; settle failed; no cancel)"
-        );
-        Ok(order.view())
-    }
-
-    fn guard(&self) -> std::sync::MutexGuard<'_, Order> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
+    let address = invoice_address(&created).unwrap_or_default();
+    let cancelled = rpc
+        .call(
+            twine_rpc,
+            "cancel_invoice",
+            json!([{ "payment_hash": payment_hash }]),
+        )
+        .await
+        .map_err(OrderError::Fiber)?;
+    let status = invoice_status(&cancelled).unwrap_or_else(|| "Cancelled".into());
+    Ok((payment_hash, address, status))
 }
 
-async fn fetch_invoice_status(
+pub(crate) async fn fetch_invoice_status(
     rpc: &FiberRpc,
     twine_rpc: &str,
     payment_hash: &str,
@@ -1092,7 +302,7 @@ async fn fetch_invoice_status(
     Ok(invoice_status(&result).unwrap_or_else(|| "unknown".into()))
 }
 
-fn require_received_for_dispute(status: &str) -> Result<(), OrderError> {
+pub(crate) fn require_received_for_dispute(status: &str) -> Result<(), OrderError> {
     if status == "Received" {
         return Ok(());
     }
@@ -1101,7 +311,7 @@ fn require_received_for_dispute(status: &str) -> Result<(), OrderError> {
     )))
 }
 
-fn require_received_for_award(status: &str) -> Result<(), OrderError> {
+pub(crate) fn require_received_for_award(status: &str) -> Result<(), OrderError> {
     if status == "Expired" {
         return Err(OrderError::BadState(
             "award refused: hold invoice is Expired; neither buyer nor seller award can run"
@@ -1116,7 +326,7 @@ fn require_received_for_award(status: &str) -> Result<(), OrderError> {
     )))
 }
 
-async fn poll_invoice_received(
+pub(crate) async fn poll_invoice_received(
     rpc: &FiberRpc,
     twine_rpc: &str,
     payment_hash: &str,
@@ -1149,7 +359,7 @@ async fn poll_invoice_received(
     }
 }
 
-async fn poll_payment_done(
+pub(crate) async fn poll_payment_done(
     rpc: &FiberRpc,
     node_rpc: &str,
     payment_hash: &str,
@@ -1186,7 +396,7 @@ async fn poll_payment_done(
     }
 }
 
-async fn poll_invoice_paid(
+pub(crate) async fn poll_invoice_paid(
     rpc: &FiberRpc,
     twine_rpc: &str,
     payment_hash: &str,
@@ -1219,6 +429,80 @@ async fn poll_invoice_paid(
     }
 }
 
+pub(crate) async fn attempt_settle_after_expiry(
+    rpc: &FiberRpc,
+    twine_rpc: &str,
+    payment_hash: &str,
+    preimage: Option<&str>,
+) -> Option<String> {
+    match preimage {
+        Some(preimage) => match rpc
+            .call(
+                twine_rpc,
+                "settle_invoice",
+                json!([{
+                    "payment_hash": payment_hash,
+                    "payment_preimage": preimage,
+                }]),
+            )
+            .await
+        {
+            Ok(_) => Some(
+                "settle_invoice returned ok after Expired (unexpected; not treated as Path A settle)"
+                    .to_string(),
+            ),
+            Err(err) => Some(err),
+        },
+        None => Some("missing sealed preimage S; settle_invoice not attempted".into()),
+    }
+}
+
+pub(crate) async fn send_payment_to_invoice(
+    rpc: &FiberRpc,
+    twine_rpc: &str,
+    invoice: &str,
+) -> Result<Value, String> {
+    rpc.call(
+        twine_rpc,
+        "send_payment",
+        json!([{
+            "invoice": invoice,
+            "max_fee_amount": "0x5f5e100",
+        }]),
+    )
+    .await
+}
+
+pub(crate) async fn settle_hold(
+    rpc: &FiberRpc,
+    twine_rpc: &str,
+    payment_hash: &str,
+    preimage: &str,
+) -> Result<Value, String> {
+    rpc.call(
+        twine_rpc,
+        "settle_invoice",
+        json!([{
+            "payment_hash": payment_hash,
+            "payment_preimage": preimage,
+        }]),
+    )
+    .await
+}
+
+pub(crate) async fn cancel_hold_invoice(
+    rpc: &FiberRpc,
+    twine_rpc: &str,
+    payment_hash: &str,
+) -> Result<Value, String> {
+    rpc.call(
+        twine_rpc,
+        "cancel_invoice",
+        json!([{ "payment_hash": payment_hash }]),
+    )
+    .await
+}
+
 fn generate_preimage() -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -1242,20 +526,7 @@ fn invoice_status(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn invoice_payment_hash(value: &Value) -> Option<String> {
-    value
-        .pointer("/invoice/data/payment_hash")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .get("payment_hash")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-}
-
-fn payment_hash_of(value: &Value) -> Option<String> {
+pub(crate) fn payment_hash_of(value: &Value) -> Option<String> {
     value
         .get("payment_hash")
         .and_then(Value::as_str)
@@ -1300,34 +571,18 @@ fn invoice_final_expiry_delta(value: &Value) -> Option<String> {
     None
 }
 
-async fn seller_local_balance(rpc: &FiberRpc, config: &Config) -> Result<String, OrderError> {
-    let twine_info = rpc
-        .call(&config.twine_rpc, "node_info", Value::Array(vec![]))
-        .await
-        .map_err(OrderError::Fiber)?;
-    let twine_pubkey = twine_info
-        .get("pubkey")
-        .and_then(Value::as_str)
-        .ok_or_else(|| OrderError::Fiber("twine node_info missing pubkey".into()))?;
-    let listed = rpc
-        .call(&config.seller_rpc, "list_channels", json!([{}]))
-        .await
-        .map_err(OrderError::Fiber)?;
-    let channel = crate::health::channel_for_peer(&listed, twine_pubkey)
-        .map_err(OrderError::Fiber)?
-        .ok_or_else(|| OrderError::Fiber("seller→twine channel not found".into()))?;
-    channel
-        .get("local_balance")
-        .and_then(|value| match value {
-            Value::String(text) => Some(text.clone()),
-            Value::Number(number) => Some(number.to_string()),
-            _ => None,
-        })
-        .ok_or_else(|| OrderError::Fiber("seller→twine channel missing local_balance".into()))
+pub fn amount_to_shannon(amount: &str) -> Result<u128, String> {
+    parse_decimal_8(amount).and_then(|value| {
+        if value == 0 {
+            Err("amount must be greater than zero".to_string())
+        } else {
+            Ok(value)
+        }
+    })
 }
 
-pub fn amount_to_shannon(amount: &str) -> Result<u128, String> {
-    let normalized = normalize_amount(amount)?;
+pub fn parse_decimal_8(raw: &str) -> Result<u128, String> {
+    let normalized = normalize_decimal(raw)?;
     let (whole, frac) = match normalized.split_once('.') {
         Some((whole, frac)) => (whole, frac),
         None => (normalized.as_str(), ""),
@@ -1348,19 +603,53 @@ pub fn amount_to_shannon(amount: &str) -> Result<u128, String> {
         .ok_or_else(|| "amount is too large".to_string())
 }
 
-fn save(path: &Path, order: &Order) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        }
+pub fn format_decimal_8(scaled: u128) -> String {
+    let whole = scaled / SHANNONS_PER_CKB;
+    let frac = scaled % SHANNONS_PER_CKB;
+    if frac == 0 {
+        return whole.to_string();
     }
-    let text = serde_json::to_string_pretty(order).map_err(|err| err.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text).map_err(|err| err.to_string())?;
-    fs::rename(&tmp, path).map_err(|err| err.to_string())
+    let frac = format!("{frac:08}");
+    let frac = frac.trim_end_matches('0');
+    format!("{whole}.{frac}")
+}
+
+pub fn ckb_from_fiat(fiat: &str, rate: &str) -> Result<String, String> {
+    let fiat = parse_decimal_8(fiat)?;
+    let rate = parse_decimal_8(rate)?;
+    if rate == 0 {
+        return Err("rate must be greater than zero".to_string());
+    }
+    let ckb = fiat
+        .checked_mul(SHANNONS_PER_CKB)
+        .and_then(|v| v.checked_div(rate))
+        .ok_or_else(|| "amount is too large".to_string())?;
+    if ckb == 0 {
+        return Err("fiat amount is too small for this rate".to_string());
+    }
+    Ok(format_decimal_8(ckb))
+}
+
+pub fn add_ckb(left: &str, right: &str) -> Result<String, String> {
+    let sum = parse_decimal_8(left)?
+        .checked_add(parse_decimal_8(right)?)
+        .ok_or_else(|| "amount is too large".to_string())?;
+    Ok(format_decimal_8(sum))
+}
+
+pub fn cmp_ckb(left: &str, right: &str) -> Result<std::cmp::Ordering, String> {
+    Ok(parse_decimal_8(left)?.cmp(&parse_decimal_8(right)?))
 }
 
 pub fn normalize_amount(raw: &str) -> Result<String, String> {
+    let text = normalize_decimal(raw)?;
+    if parse_decimal_8(&text)? == 0 {
+        return Err("amount must be greater than zero".to_string());
+    }
+    Ok(text)
+}
+
+pub fn normalize_decimal(raw: &str) -> Result<String, String> {
     let text = raw.trim();
     if text.is_empty() {
         return Err("amount is required".to_string());
@@ -1373,7 +662,7 @@ pub fn normalize_amount(raw: &str) -> Result<String, String> {
         || !whole.chars().all(|ch| ch.is_ascii_digit())
         || !frac.chars().all(|ch| ch.is_ascii_digit())
     {
-        return Err("amount must be a positive number of CKB".to_string());
+        return Err("amount must be a positive number".to_string());
     }
     if frac.len() > 8 {
         return Err("amount supports at most 8 decimal places".to_string());
@@ -1381,9 +670,6 @@ pub fn normalize_amount(raw: &str) -> Result<String, String> {
     let whole = whole.trim_start_matches('0');
     let whole = if whole.is_empty() { "0" } else { whole };
     let frac = frac.trim_end_matches('0');
-    if whole == "0" && frac.is_empty() {
-        return Err("amount must be greater than zero".to_string());
-    }
     if frac.is_empty() {
         Ok(whole.to_string())
     } else {
@@ -1391,8 +677,18 @@ pub fn normalize_amount(raw: &str) -> Result<String, String> {
     }
 }
 
-fn timestamp() -> String {
+pub fn normalize_pubkey(pubkey: &str) -> String {
+    pubkey.trim().trim_start_matches("0x").to_ascii_lowercase()
+}
+
+pub fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub fn new_id() -> String {
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 #[cfg(test)]
@@ -1412,6 +708,14 @@ mod tests {
         assert!(normalize_amount("0.0").is_err());
         assert!(normalize_amount("1.123456789").is_err());
         assert_eq!(normalize_amount("0.00000001").as_deref(), Ok("0.00000001"));
+    }
+
+    #[test]
+    fn fiat_over_rate_is_integer_shannon_ckb() {
+        assert_eq!(ckb_from_fiat("2000", "2000").as_deref(), Ok("1"));
+        assert_eq!(ckb_from_fiat("1000", "2000").as_deref(), Ok("0.5"));
+        assert!(ckb_from_fiat("1", "200000000000").is_err());
+        assert!(ckb_from_fiat("10", "0").is_err());
     }
 
     #[test]
