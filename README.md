@@ -1,6 +1,6 @@
 # Twine Fiber POC
 
-A testnet proof of concept for a Fiber hold-invoice P2P market. One Flutter app is the client. One Rust daemon is the coordinator. Fiber nodes (any user, plus Twine) move real testnet CKB.
+A testnet proof of concept for a Fiber hold-invoice P2P market. One Flutter app is the trader client. One Rust daemon is the coordinator. The solver is whoever can reach that daemon — curl, not a screen in the app. Fiber nodes (any user, plus Twine) move real testnet CKB.
 
 A person is one Fiber node. The Fiber pubkey is the user id — anyone can list or take. The app never holds a Fiber key. Fiat is a button. The CKB movement is `new_invoice`, `send_payment`, `settle_invoice`, and TLC expiry on testnet (`Fibt`).
 
@@ -21,7 +21,7 @@ You need **two phones** (two users): two iOS Simulators, two Android emulators, 
 2. Launch the app on two devices, each pointed at a different Fiber RPC (see [Two phones](#two-phones-required-for-a-real-trade)).
 3. User A posts a sell ad. User B takes it from BUY CKB.
 4. A locks the hold. B uploads a receipt and notifies A. A marks payment received.
-5. Watch one of the four endings on testnet. Twine awards a trade only after someone files a dispute.
+5. Watch one of the four endings on testnet. Twine awards a trade only after someone files a dispute. The solver then calls the daemon (see [Solver](#solver)).
 
 ```text
 [ Seller node ]              [ Twine daemon ]                    [ Buyer node ]
@@ -37,7 +37,7 @@ You need **two phones** (two users): two iOS Simulators, two Android emulators, 
 | --- | --- | --- |
 | A | Buyer is reachable. Seller releases | Daemon pays the buyer’s invoice, then `settle_invoice(H, S)`. Invoice `Paid`. State `Settled` |
 | B | Payment to the buyer cannot route | `send_payment` fails. No `settle_invoice`. Hold stays `Received`. State `Leg2Failed`. A new invoice retries path A |
-| C | Either side files a dispute with a reason. Operator reads the chat and proof | Buyer wins runs path A. If that payment fails, the order stays `Disputed` and is not settled. Seller wins leaves the hold `Received` until expiry |
+| C | Either side files a dispute with a reason. Solver on the host reads the chat and proof, then curls the daemon | Buyer wins runs path A. If that payment fails, the order stays `Disputed` and is not settled. Seller wins leaves the hold `Received` until expiry |
 | D | Nobody settles before the timelock | Fiber marks the invoice `Expired` and the seller is refunded. A later `settle_invoice` fails. `cancel_invoice` is not called |
 
 One open trade per ad. The listing is not locked. Creating a trade reserves that slice (`ckb = pay / price`) and hides the ad until the trade ends. The reserved CKB returns if the trade is `Cancelled` or `Expired`. A `Settled` trade keeps the slice subtracted; leftover stays on the book if it still covers the minimum take.
@@ -208,7 +208,7 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 
 `TWINE_RELEASE_PAUSE_MS` (milliseconds) pauses the daemon after it has the buyer invoice and before `send_payment`, if you would rather stop the buyer process than disconnect the peer.
 
-**Path C.** Either side can chat while the hold is still `Received`. File a dispute with a reason — that filing is the only request for Twine to step in. The app does not award the trade. Daemon `POST /trades/:id/award_buyer` runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. `POST /trades/:id/award_seller` does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
+**Path C.** Either side can chat while the hold is still `Received`. File a dispute with a reason — that filing is the only request for Twine to step in. The app does not award the trade. The solver does, from the host (see [Solver](#solver)).
 
 A seller-wins trade stays open on that ad, so a second take is blocked until the hold expires.
 
@@ -221,6 +221,40 @@ When you are done:
 ```
 
 That stops the daemon (if `nodes/daemon.pid` exists) and the three nodes. Quit each `flutter run` with `q`.
+
+## Solver
+
+Traders use the Flutter app; the operator awards from another tool. This POC has no admin app and no admin key. The tool is HTTP against the daemon on the host.
+
+1. In the app, either side files a dispute. State becomes `Disputed`. Funds stay locked (`Received`).
+2. On the host, read the trade: chat, `dispute_reason`, and the receipt.
+3. Award buyer or award seller.
+
+```bash
+TRADE_ID=t1   # from the order screen, or GET /trades?pubkey=
+
+curl -s "http://127.0.0.1:8080/trades/$TRADE_ID"
+curl -s "http://127.0.0.1:8080/trades/$TRADE_ID/proof" -o /tmp/receipt.bin
+```
+
+**Buyer wins** pays the stored buyer invoice, then `settle_invoice` (path A). If that payment fails, the order stays `Disputed` and is not settled.
+
+```bash
+INVOICE=$(curl -s "http://127.0.0.1:8080/trades/$TRADE_ID" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['buyer_invoice'])")
+
+curl -s -X POST "http://127.0.0.1:8080/trades/$TRADE_ID/award_buyer" \
+  -H 'content-type: application/json' \
+  -d "{\"invoice\":\"$INVOICE\"}"
+```
+
+**Seller wins** does not settle and does not cancel. The log says the seller is refunded when the TLC expires (path D’s refund).
+
+```bash
+curl -s -X POST "http://127.0.0.1:8080/trades/$TRADE_ID/award_seller"
+```
+
+After the hold is `Expired`, both awards fail. Anyone who can reach `:8080` can award — fine on localhost, not if the daemon is public.
 
 ## HTTP API
 
@@ -247,8 +281,8 @@ The daemon is the only process that talks to the Twine `fnn`. User nodes are cal
 | `POST` | `/trades/:id/retry` | `{"invoice":"…"}` path A again, from `Leg2Failed` |
 | `POST` | `/trades/:id/dispute` | `{"from":"lister"|"taker","reason":"…"}` |
 | `POST` | `/trades/:id/chat` | `{"from":"lister","text":"…"}` or `"from":"taker"` on an open trade |
-| `POST` | `/trades/:id/award_buyer` | `{"invoice":"…"}` |
-| `POST` | `/trades/:id/award_seller` | |
+| `POST` | `/trades/:id/award_buyer` | solver only. `{"invoice":"…"}`. Path A. Failed pay leaves `Disputed` |
+| `POST` | `/trades/:id/award_seller` | solver only. Hold stays `Received` until expiry |
 
 Errors are `{"error":"…"}` with 400 (bad amount or state), 404 (unknown ad or trade), 409 (an ad already has an open trade), or 502 (Fiber).
 
