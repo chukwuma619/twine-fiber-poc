@@ -69,3 +69,15 @@ String takeCap(String maxPay, String available, String price) {
 String shannonHex(String ckb) {
   return '0x${shannonsFromDecimal(ckb).toRadixString(16)}';
 }
+
+String ckbFromShannonHex(String? raw) {
+  final text = raw?.trim() ?? '';
+  if (text.isEmpty) {
+    return '0';
+  }
+  final hex = text.toLowerCase().startsWith('0x') ? text.substring(2) : text;
+  if (hex.isEmpty || !RegExp(r'^[0-9a-f]+$').hasMatch(hex)) {
+    return '0';
+  }
+  return formatDecimal8(BigInt.parse(hex, radix: 16));
+}

@@ -10,5 +10,8 @@ void main() {
     expect(takeCap('3000', '1', '2000'), '2000');
     expect(takeCap('1000', '2', '2000'), '1000');
     expect(shannonHex('1'), '0x5f5e100');
+    expect(ckbFromShannonHex('0x5f5e100'), '1');
+    expect(ckbFromShannonHex('0x2faf080'), '0.5');
+    expect(ckbFromShannonHex(''), '0');
   });
 }

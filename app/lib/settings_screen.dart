@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'amounts.dart';
 import 'currencies.dart';
 import 'daemon_api.dart';
 import 'fiber_api.dart';
@@ -32,6 +33,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _error;
   String? _status;
   FiberChannel? _toTwine;
+  List<FiberChannel> _channels = const [];
   TwineInfo? _twine;
   var _busy = false;
 
@@ -64,7 +66,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _persist({
     String? pubkey,
-    bool? operatorTools,
     String? preferredCurrency,
   }) {
     return widget.settings.update(
@@ -73,7 +74,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         daemonUrl: _daemonUrl.text,
         p2pAddress: _p2p.text,
         pubkey: pubkey,
-        operatorTools: operatorTools,
         preferredCurrency: preferredCurrency,
       ),
     );
@@ -89,16 +89,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final pubkey = await widget.fiber.nodePubkey(_fiberRpc.text);
       await widget.settings.update(_user.copyWith(pubkey: pubkey));
       final twine = await widget.daemon.fetchTwine(_daemonUrl.text);
-      FiberChannel? channel;
-      if (twine.pubkey != null) {
-        channel = await widget.fiber.channelTo(_fiberRpc.text, twine.pubkey!);
-      }
+      final loaded = await _loadChannels(twine.pubkey);
       if (!mounted) {
         return;
       }
       setState(() {
         _twine = twine;
-        _toTwine = channel;
+        _channels = loaded.channels;
+        _toTwine = loaded.toTwine;
         _status = 'This phone is ${shortPubkey(pubkey)}';
         _busy = false;
       });
@@ -138,13 +136,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           fundingHex: _defaultFundingHex,
         );
       }
-      final channel = await widget.fiber.channelTo(_fiberRpc.text, pubkey);
+      final loaded = await _loadChannels(pubkey);
       if (!mounted) {
         return;
       }
       setState(() {
         _twine = twine;
-        _toTwine = channel;
+        _channels = loaded.channels;
+        _toTwine = loaded.toTwine;
         _status = 'You can sell. Outbound channel to Twine is ready.';
         _busy = false;
       });
@@ -176,10 +175,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
         pubkey: pubkey,
         address: _p2p.text,
       );
+      final twine = await widget.daemon.fetchTwine(_daemonUrl.text);
+      final loaded = await _loadChannels(twine.pubkey);
       if (!mounted) {
         return;
       }
       setState(() {
+        _twine = twine;
+        _channels = loaded.channels;
+        _toTwine = loaded.toTwine;
         _status = result.channelOpen
             ? 'You can receive CKB. Twine opened a return channel.'
             : result.message;
@@ -194,6 +198,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _busy = false;
       });
     }
+  }
+
+  Future<({List<FiberChannel> channels, FiberChannel? toTwine})> _loadChannels(
+    String? twinePubkey,
+  ) async {
+    final channels = await widget.fiber.listChannels(_fiberRpc.text);
+    FiberChannel? toTwine;
+    if (twinePubkey != null) {
+      for (final channel in channels) {
+        if (samePubkey(channel.peerPubkey, twinePubkey)) {
+          toTwine = channel;
+          if (channel.open) {
+            break;
+          }
+        }
+      }
+    }
+    return (channels: channels, toTwine: toTwine);
   }
 
   Future<void> _copy(String value) async {
@@ -294,7 +316,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 12),
           _SectionCard(
-            title: 'Channels',
+            title: 'Channels through Twine',
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -302,13 +324,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _channelCopy,
                   key: const Key('channel-status'),
                 ),
-                if (_twine?.pubkey != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Twine ${shortPubkey(_twine!.pubkey!)}',
-                    style: Theme.of(context).textTheme.bodySmall,
+                const SizedBox(height: 8),
+                Text(
+                  'Lock and payout both route through Twine. This list is this phone’s channels with that node.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
-                ],
+                ),
+                const SizedBox(height: 12),
+                if (_channels.isEmpty)
+                  const Text(
+                    'No channels yet.',
+                    key: Key('channel-empty'),
+                  )
+                else
+                  for (final channel in _channels)
+                    _ChannelTile(
+                      channel: channel,
+                      twine: samePubkey(channel.peerPubkey, _twine?.pubkey),
+                    ),
                 const SizedBox(height: 12),
                 FilledButton(
                   key: const Key('open-channel-twine'),
@@ -321,29 +355,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onPressed: _busy ? null : _askTwineChannel,
                   child: const Text('Ask Twine for a return channel'),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  'Sell needs an outbound channel. Buy needs Twine to be able to pay you.',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
               ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          _SectionCard(
-            title: 'Coordinator',
-            child: SwitchListTile(
-              key: const Key('operator-tools'),
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Dispute tools'),
-              subtitle: const Text(
-                'Show Award buyer and Award seller after someone files a dispute. '
-                'Normal trades release without this.',
-              ),
-              value: _user.operatorTools,
-              onChanged: (value) => _persist(operatorTools: value),
             ),
           ),
           const SizedBox(height: 12),
@@ -388,6 +400,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const SizedBox(height: 8),
             Text(_error!, key: const Key('error-message')),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ChannelTile extends StatelessWidget {
+  const _ChannelTile({required this.channel, required this.twine});
+
+  final FiberChannel channel;
+  final bool twine;
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final send = ckbFromShannonHex(channel.localBalance);
+    final receive = ckbFromShannonHex(channel.remoteBalance);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            twine ? 'Twine' : shortPubkey(channel.peerPubkey),
+            key: twine ? const Key('channel-twine') : null,
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+          Text(
+            channel.open ? 'Ready' : 'Pending',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: muted),
+          ),
+          Text('You can send $send CKB'),
+          Text(
+            twine ? 'Twine can pay you $receive CKB' : 'Peer can send $receive CKB',
+          ),
+          if (channel.channelId != null)
+            SelectableText(
+              channel.channelId!,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: muted),
+            ),
         ],
       ),
     );

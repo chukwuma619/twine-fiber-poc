@@ -317,7 +317,6 @@ void main() {
             initial: const UserSettings(
               daemonUrl: 'http://127.0.0.1:8080',
               pubkey: lister,
-              operatorTools: true,
             ),
           ),
           daemon: widgetDaemon(client),
@@ -332,13 +331,11 @@ void main() {
     expect(find.text('Release CKB'), findsOneWidget);
     expect(find.byKey(const Key('release')), findsOneWidget);
     expect(find.byKey(const Key('fiat-sent')), findsNothing);
-    expect(find.byKey(const Key('award-buyer')), findsNothing);
-    expect(find.byKey(const Key('award-seller')), findsNothing);
     expect(find.byKey(const Key('proof-image')), findsOneWidget);
     expect(find.byKey(const Key('open-dispute')), findsOneWidget);
   });
 
-  testWidgets('award buttons appear only after a filed dispute', (tester) async {
+  testWidgets('filed dispute shows the appeal, not award buttons', (tester) async {
     await tester.binding.setSurfaceSize(const Size(800, 1600));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
@@ -365,7 +362,6 @@ void main() {
             initial: const UserSettings(
               daemonUrl: 'http://127.0.0.1:8080',
               pubkey: lister,
-              operatorTools: true,
             ),
           ),
           daemon: widgetDaemon(client),
@@ -378,8 +374,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
 
     expect(find.textContaining('seller has not released'), findsOneWidget);
-    expect(find.byKey(const Key('award-buyer')), findsOneWidget);
-    expect(find.byKey(const Key('award-seller')), findsOneWidget);
+    expect(find.byKey(const Key('award-buyer')), findsNothing);
+    expect(find.byKey(const Key('award-seller')), findsNothing);
     expect(find.byKey(const Key('release')), findsNothing);
   });
 

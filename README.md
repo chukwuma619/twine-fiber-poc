@@ -180,7 +180,7 @@ Settings stores this phone’s `fnn` RPC, P2P address, and the Twine daemon URL.
 | Market | BUY CKB is other people’s ads. SELL CKB is yours (badge **YOUR OFFER**). Tap + to post. Tap someone else’s offer to take. A seller with a new take sees **New order — accept** even while the ad is hidden |
 | Post ad | Available (CKB), currency, price (that currency per CKB, shown as `50 NGN/CKB`), min–max per take, payment rail and handle |
 | Order | Accept / Pay / Release. Lister: Accept order (Fiber lock), Reject, Release CKB. Taker: pay card, upload receipt, I have paid, Retry. Either side: cancel while the hold is Open, chat, File dispute |
-| Settings | Channel status. Open channel to Twine. Ask Twine for a return channel. Operator tools toggle |
+| Settings | Channel status. Open channel to Twine. Ask Twine for a return channel |
 
 **Path A (two phones).**
 
@@ -208,7 +208,7 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 
 `TWINE_RELEASE_PAUSE_MS` (milliseconds) pauses the daemon after it has the buyer invoice and before `send_payment`, if you would rather stop the buyer process than disconnect the peer.
 
-**Path C.** Either side can chat while the hold is still `Received`. File a dispute with a reason — that filing is the only request for Twine to step in. Award buyer and Award seller stay behind Operator tools and only appear after the appeal. Award buyer runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. Award seller does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
+**Path C.** Either side can chat while the hold is still `Received`. File a dispute with a reason — that filing is the only request for Twine to step in. The app does not award the trade. Daemon `POST /trades/:id/award_buyer` runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. `POST /trades/:id/award_seller` does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
 
 A seller-wins trade stays open on that ad, so a second take is blocked until the hold expires.
 

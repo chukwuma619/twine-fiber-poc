@@ -29,7 +29,6 @@ class UserSettings {
     this.fiberRpc = _envFiberRpc,
     this.daemonUrl = '',
     this.p2pAddress = _envP2p,
-    this.operatorTools = false,
     this.preferredCurrency = 'NGN',
     this.pubkey,
   });
@@ -37,7 +36,6 @@ class UserSettings {
   final String fiberRpc;
   final String daemonUrl;
   final String p2pAddress;
-  final bool operatorTools;
   final String preferredCurrency;
   final String? pubkey;
 
@@ -45,7 +43,6 @@ class UserSettings {
     String? fiberRpc,
     String? daemonUrl,
     String? p2pAddress,
-    bool? operatorTools,
     String? preferredCurrency,
     String? pubkey,
     bool clearPubkey = false,
@@ -54,7 +51,6 @@ class UserSettings {
       fiberRpc: fiberRpc ?? this.fiberRpc,
       daemonUrl: daemonUrl ?? this.daemonUrl,
       p2pAddress: p2pAddress ?? this.p2pAddress,
-      operatorTools: operatorTools ?? this.operatorTools,
       preferredCurrency: preferredCurrency ?? this.preferredCurrency,
       pubkey: clearPubkey ? null : (pubkey ?? this.pubkey),
     );
@@ -84,7 +80,6 @@ class SettingsController extends ChangeNotifier {
       fiberRpc: prefs.getString('fiberRpc') ?? settings.fiberRpc,
       daemonUrl: prefs.getString('daemonUrl') ?? settings.daemonUrl,
       p2pAddress: prefs.getString('p2pAddress') ?? settings.p2pAddress,
-      operatorTools: prefs.getBool('operatorTools') ?? settings.operatorTools,
       preferredCurrency:
           prefs.getString('preferredCurrency') ?? settings.preferredCurrency,
       pubkey: prefs.getString('pubkey') ?? settings.pubkey,
@@ -101,10 +96,10 @@ class SettingsController extends ChangeNotifier {
     }
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('name');
+    await prefs.remove('operatorTools');
     await prefs.setString('fiberRpc', next.fiberRpc);
     await prefs.setString('daemonUrl', next.daemonUrl);
     await prefs.setString('p2pAddress', next.p2pAddress);
-    await prefs.setBool('operatorTools', next.operatorTools);
     await prefs.setString('preferredCurrency', next.preferredCurrency);
     if (next.pubkey == null) {
       await prefs.remove('pubkey');

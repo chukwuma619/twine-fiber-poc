@@ -329,7 +329,6 @@ class _TradeScreenState extends State<TradeScreen> {
     final trade = _trade;
     final listed = trade?.isLister(_user.pubkey) ?? false;
     final took = trade?.isTaker(_user.pubkey) ?? false;
-    final operator = _user.operatorTools;
     final canChat = (took || listed) && (trade?.canChat ?? false) && !_busy;
     final chatReady = canChat && _chat.text.trim().isNotEmpty;
     final canAppeal =
@@ -576,41 +575,6 @@ class _TradeScreenState extends State<TradeScreen> {
                 'Appeal (${trade.disputeFrom ?? 'party'}): ${trade.disputeReason}',
                 key: const Key('dispute-reason-line'),
               ),
-            if (operator) ...[
-              const SizedBox(height: 8),
-              FilledButton(
-                key: const Key('award-buyer'),
-                onPressed: _busy
-                    ? null
-                    : () => _run(() async {
-                        final invoice = took
-                            ? await _buyerInvoice()
-                            : (trade.buyerInvoice ??
-                                (throw const DaemonException(
-                                  'buyer must submit a payout invoice first',
-                                )));
-                        return widget.daemon.awardBuyer(
-                          _user.daemonUrl,
-                          widget.tradeId,
-                          invoice: invoice,
-                        );
-                      }),
-                child: const Text('Award buyer'),
-              ),
-              const SizedBox(height: 8),
-              FilledButton(
-                key: const Key('award-seller'),
-                onPressed: _busy
-                    ? null
-                    : () => _run(
-                        () => widget.daemon.awardSeller(
-                          _user.daemonUrl,
-                          widget.tradeId,
-                        ),
-                      ),
-                child: const Text('Award seller'),
-              ),
-            ],
             if (trade.sellerWinsLogged)
               const Padding(
                 padding: EdgeInsets.only(top: 8),
