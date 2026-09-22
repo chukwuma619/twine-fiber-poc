@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'currencies.dart';
 import 'daemon_api.dart';
 import 'fiber_api.dart';
 import 'settings.dart';
@@ -22,20 +23,15 @@ class PostAdScreen extends StatefulWidget {
 
 class _PostAdScreenState extends State<PostAdScreen> {
   final TextEditingController _amount = TextEditingController();
-  final TextEditingController _currency = TextEditingController(text: 'NGN');
   final TextEditingController _price = TextEditingController();
   final TextEditingController _min = TextEditingController();
   final TextEditingController _max = TextEditingController();
   final TextEditingController _method = TextEditingController(text: 'Opay');
+  var _currency = fiatCurrencies.first;
   String? _error;
   var _busy = false;
 
   UserSettings get _user => widget.settings.settings;
-
-  String get _currencyCode {
-    final text = _currency.text.trim();
-    return text.isEmpty ? 'NGN' : text.toUpperCase();
-  }
 
   Future<void> _submit() async {
     setState(() {
@@ -52,7 +48,7 @@ class _PostAdScreenState extends State<PostAdScreen> {
         _user.daemonUrl,
         pubkey: pubkey,
         available: _amount.text,
-        currency: _currencyCode,
+        currency: _currency.code,
         price: _price.text,
         min: _min.text,
         max: _max.text,
@@ -76,7 +72,6 @@ class _PostAdScreenState extends State<PostAdScreen> {
   @override
   void dispose() {
     _amount.dispose();
-    _currency.dispose();
     _price.dispose();
     _min.dispose();
     _max.dispose();
@@ -97,34 +92,49 @@ class _PostAdScreenState extends State<PostAdScreen> {
             decoration: const InputDecoration(labelText: 'Available'),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
           ),
-          TextField(
+          DropdownButtonFormField<FiatCurrency>(
             key: const Key('ad-currency'),
-            controller: _currency,
-            decoration: const InputDecoration(
-              labelText: 'Currency',
-              hintText: 'NGN, GHS, USD…',
-            ),
-            textCapitalization: TextCapitalization.characters,
+            initialValue: _currency,
+            decoration: const InputDecoration(labelText: 'Currency'),
+            items: [
+              for (final currency in fiatCurrencies)
+                DropdownMenuItem(
+                  value: currency,
+                  child: Text(currency.label),
+                ),
+            ],
+            onChanged: _busy
+                ? null
+                : (value) {
+                    if (value == null) {
+                      return;
+                    }
+                    setState(() => _currency = value);
+                  },
           ),
           TextField(
             key: const Key('ad-price'),
             controller: _price,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               labelText: 'Price',
-              hintText: 'for 1 CKB',
+              hintText: '${_currency.code} for 1 CKB',
             ),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
           ),
           TextField(
             key: const Key('ad-min'),
             controller: _min,
-            decoration: const InputDecoration(labelText: 'Min per trade'),
+            decoration: InputDecoration(
+              labelText: 'Min per trade (${_currency.code})',
+            ),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
           ),
           TextField(
             key: const Key('ad-max'),
             controller: _max,
-            decoration: const InputDecoration(labelText: 'Max per trade'),
+            decoration: InputDecoration(
+              labelText: 'Max per trade (${_currency.code})',
+            ),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
           ),
           TextField(
