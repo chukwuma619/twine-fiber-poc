@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::health::Config;
 use crate::order::{
     add_ckb, attempt_settle_after_expiry, cancel_hold_invoice, ckb_from_fiat, cmp_ckb,
-    create_hold_invoice, demo_cancel_invoice, fetch_invoice_status, new_id, normalize_amount,
-    normalize_pubkey, payment_hash_of, poll_invoice_paid, poll_invoice_received, poll_payment_done,
-    require_received_for_award, require_received_for_dispute, send_payment_to_invoice, settle_hold,
-    timestamp, BuyerInvoiceBody, CreateAdBody, CreateTradeBody, OrderError, OrderState,
-    PayFailureMode, PostChatBody, Trade, TradeView, FINAL_EXPIRY_DELTA_MS,
+    create_hold_invoice, demo_cancel_invoice, fetch_invoice_status, fiat_from_ckb, new_id,
+    normalize_amount, normalize_pubkey, payment_hash_of, poll_invoice_paid, poll_invoice_received,
+    poll_payment_done, require_received_for_award, require_received_for_dispute,
+    send_payment_to_invoice, settle_hold, timestamp, BuyerInvoiceBody, CreateAdBody,
+    CreateTradeBody, OrderError, OrderState, PayFailureMode, PostChatBody, Trade, TradeView,
+    FINAL_EXPIRY_DELTA_MS,
 };
 use crate::rpc::FiberRpc;
 
@@ -34,11 +35,18 @@ pub struct Market {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ad {
     pub id: String,
-    pub seller_pubkey: String,
-    pub seller_name: String,
-    pub available_ckb: String,
-    pub fiat: String,
-    pub rate: String,
+    #[serde(alias = "seller_pubkey")]
+    pub pubkey: String,
+    #[serde(alias = "available_ckb")]
+    pub available: String,
+    #[serde(alias = "fiat")]
+    pub currency: String,
+    #[serde(alias = "rate")]
+    pub price: String,
+    #[serde(default, alias = "min_fiat")]
+    pub min: String,
+    #[serde(default, alias = "max_fiat")]
+    pub max: String,
     pub payment_method: String,
     #[serde(default)]
     pub cancelled: bool,
@@ -49,11 +57,12 @@ pub struct Ad {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AdView {
     pub id: String,
-    pub seller_pubkey: String,
-    pub seller_name: String,
-    pub available_ckb: String,
-    pub fiat: String,
-    pub rate: String,
+    pub pubkey: String,
+    pub available: String,
+    pub currency: String,
+    pub price: String,
+    pub min: String,
+    pub max: String,
     pub payment_method: String,
     pub open_trade_id: Option<String>,
 }
@@ -62,11 +71,12 @@ impl Ad {
     pub fn view(&self) -> AdView {
         AdView {
             id: self.id.clone(),
-            seller_pubkey: self.seller_pubkey.clone(),
-            seller_name: self.seller_name.clone(),
-            available_ckb: self.available_ckb.clone(),
-            fiat: self.fiat.clone(),
-            rate: self.rate.clone(),
+            pubkey: self.pubkey.clone(),
+            available: self.available.clone(),
+            currency: self.currency.clone(),
+            price: self.price.clone(),
+            min: self.min.clone(),
+            max: self.max.clone(),
             payment_method: self.payment_method.clone(),
             open_trade_id: self.open_trade_id.clone(),
         }
@@ -110,8 +120,7 @@ impl MarketStore {
         let mut ads: Vec<AdView> = market
             .ads
             .values()
-            .filter(|ad| !ad.cancelled)
-            .filter(|ad| parse_available(&ad.available_ckb).is_ok_and(|value| value > 0))
+            .filter(|ad| ad_is_shoppable(&market, ad))
             .map(Ad::view)
             .collect();
         ads.sort_by(|left, right| left.id.cmp(&right.id));
@@ -119,27 +128,48 @@ impl MarketStore {
     }
 
     pub fn create_ad(&self, body: &CreateAdBody) -> Result<AdView, OrderError> {
-        let seller_pubkey = require_text(&body.seller_pubkey, "seller_pubkey")?;
-        let seller_name = require_text(&body.seller_name, "seller_name")?;
-        let available_ckb = normalize_amount(&body.available_ckb).map_err(OrderError::BadAmount)?;
-        let rate = normalize_amount(&body.rate).map_err(OrderError::BadAmount)?;
+        let pubkey = require_text(&body.pubkey, "pubkey")?;
+        let available = normalize_amount(&body.available).map_err(OrderError::BadAmount)?;
+        let price = normalize_amount(&body.price).map_err(OrderError::BadAmount)?;
+        let min = normalize_amount(&body.min).map_err(OrderError::BadAmount)?;
+        let max = normalize_amount(&body.max).map_err(OrderError::BadAmount)?;
         let payment_method = require_text(&body.payment_method, "payment_method")?;
-        let fiat = body
-            .fiat
+        let currency = body
+            .currency
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("NGN")
             .to_string();
+        if cmp_ckb(&min, &max).map_err(OrderError::BadAmount)? == std::cmp::Ordering::Greater {
+            return Err(OrderError::BadAmount("min cannot exceed max".into()));
+        }
+        let min_ckb = ckb_from_fiat(&min, &price).map_err(OrderError::BadAmount)?;
+        let max_ckb = ckb_from_fiat(&max, &price).map_err(OrderError::BadAmount)?;
+        if cmp_ckb(&min_ckb, &available).map_err(OrderError::BadAmount)?
+            == std::cmp::Ordering::Greater
+        {
+            return Err(OrderError::BadAmount(
+                "available is too small for the minimum take".into(),
+            ));
+        }
+        if cmp_ckb(&max_ckb, &available).map_err(OrderError::BadAmount)?
+            == std::cmp::Ordering::Greater
+        {
+            return Err(OrderError::BadAmount(
+                "max take is larger than available".into(),
+            ));
+        }
 
         let id = new_id();
         let ad = Ad {
             id: id.clone(),
-            seller_pubkey,
-            seller_name,
-            available_ckb,
-            fiat,
-            rate,
+            pubkey,
+            available,
+            currency,
+            price,
+            min,
+            max,
             payment_method,
             cancelled: false,
             open_trade_id: None,
@@ -177,8 +207,8 @@ impl MarketStore {
             .values()
             .filter(|trade| match &want {
                 Some(pubkey) => {
-                    normalize_pubkey(&trade.seller_pubkey) == *pubkey
-                        || normalize_pubkey(&trade.buyer_pubkey) == *pubkey
+                    normalize_pubkey(&trade.pubkey) == *pubkey
+                        || normalize_pubkey(&trade.taker) == *pubkey
                 }
                 None => true,
             })
@@ -209,12 +239,11 @@ impl MarketStore {
         config: &Config,
         body: &CreateTradeBody,
     ) -> Result<TradeView, OrderError> {
-        let buyer_pubkey = require_text(&body.buyer_pubkey, "buyer_pubkey")?;
-        let buyer_name = require_text(&body.buyer_name, "buyer_name")?;
-        let fiat_amount = normalize_amount(&body.fiat_amount).map_err(OrderError::BadAmount)?;
+        let taker = require_text(&body.taker, "taker")?;
+        let pay_amount = normalize_amount(&body.pay_amount).map_err(OrderError::BadAmount)?;
         let trade_id = new_id();
 
-        let (ad_id, amount, seller_pubkey, seller_name, fiat, rate, payment_method) = {
+        let (ad_id, amount, listed_by, currency, price, payment_method) = {
             let mut market = self.guard();
             let ad = market
                 .ads
@@ -227,13 +256,40 @@ impl MarketStore {
             if ad_has_open_trade(&market, &ad) {
                 return Err(OrderError::AlreadyOpen);
             }
-            if normalize_pubkey(&ad.seller_pubkey) == normalize_pubkey(&buyer_pubkey) {
+            if normalize_pubkey(&ad.pubkey) == normalize_pubkey(&taker) {
                 return Err(OrderError::BadState(
-                    "buyer and seller must be different nodes".into(),
+                    "taker must be a different user".into(),
                 ));
             }
-            let amount = ckb_from_fiat(&fiat_amount, &ad.rate).map_err(OrderError::BadAmount)?;
-            if cmp_ckb(&amount, &ad.available_ckb).map_err(OrderError::BadAmount)?
+            if !ad.min.is_empty()
+                && cmp_ckb(&pay_amount, &ad.min).map_err(OrderError::BadAmount)?
+                    == std::cmp::Ordering::Less
+            {
+                return Err(OrderError::BadAmount(format!(
+                    "take must be at least {} {}",
+                    ad.min, ad.currency
+                )));
+            }
+            if !ad.max.is_empty()
+                && cmp_ckb(&pay_amount, &ad.max).map_err(OrderError::BadAmount)?
+                    == std::cmp::Ordering::Greater
+            {
+                return Err(OrderError::BadAmount(format!(
+                    "take must be at most {} {}",
+                    ad.max, ad.currency
+                )));
+            }
+            let available_pay =
+                fiat_from_ckb(&ad.available, &ad.price).map_err(OrderError::BadAmount)?;
+            if cmp_ckb(&pay_amount, &available_pay).map_err(OrderError::BadAmount)?
+                == std::cmp::Ordering::Greater
+            {
+                return Err(OrderError::BadAmount(
+                    "not enough CKB available on this ad".into(),
+                ));
+            }
+            let amount = ckb_from_fiat(&pay_amount, &ad.price).map_err(OrderError::BadAmount)?;
+            if cmp_ckb(&amount, &ad.available).map_err(OrderError::BadAmount)?
                 == std::cmp::Ordering::Greater
             {
                 return Err(OrderError::BadAmount(
@@ -241,17 +297,15 @@ impl MarketStore {
                 ));
             }
             let remaining =
-                subtract_ckb(&ad.available_ckb, &amount).map_err(OrderError::BadAmount)?;
+                subtract_ckb(&ad.available, &amount).map_err(OrderError::BadAmount)?;
             let trade = Trade {
                 id: trade_id.clone(),
                 ad_id: ad.id.clone(),
-                seller_pubkey: ad.seller_pubkey.clone(),
-                seller_name: ad.seller_name.clone(),
-                buyer_pubkey: buyer_pubkey.clone(),
-                buyer_name: buyer_name.clone(),
-                fiat: ad.fiat.clone(),
-                rate: ad.rate.clone(),
-                fiat_amount: fiat_amount.clone(),
+                pubkey: ad.pubkey.clone(),
+                taker: taker.clone(),
+                currency: ad.currency.clone(),
+                price: ad.price.clone(),
+                pay_amount: pay_amount.clone(),
                 amount: amount.clone(),
                 payment_method: ad.payment_method.clone(),
                 state: OrderState::Pending,
@@ -265,7 +319,7 @@ impl MarketStore {
             };
             {
                 let listed = market.ads.get_mut(&body.ad_id).expect("ad exists");
-                listed.available_ckb = remaining;
+                listed.available = remaining;
                 listed.open_trade_id = Some(trade_id.clone());
             }
             market.trades.insert(trade_id.clone(), trade);
@@ -273,10 +327,9 @@ impl MarketStore {
             (
                 body.ad_id.clone(),
                 amount,
-                ad.seller_pubkey,
-                ad.seller_name,
-                ad.fiat,
-                ad.rate,
+                ad.pubkey,
+                ad.currency,
+                ad.price,
                 ad.payment_method,
             )
         };
@@ -300,7 +353,7 @@ impl MarketStore {
         trade.invoice_address = Some(address.clone());
         trade.invoice_status = Some(status.clone());
         trade.push_log(format!(
-            "created trade for {amount} CKB ({fiat_amount} {fiat} at {rate} {fiat}/CKB); seller {seller_name}"
+            "created trade for {amount} CKB ({pay_amount} {currency} at {price} {currency}/CKB); listed by {listed_by}"
         ));
         trade.push_log(format!(
             "hold invoice created H={payment_hash} final_expiry_delta={FINAL_EXPIRY_DELTA_MS}ms ({}) S sealed in daemon (never sent to app)",
@@ -308,7 +361,7 @@ impl MarketStore {
         ));
         trade.push_log(format!("invoice address {address}"));
         trade.push_log(format!("invoice status {status}"));
-        let _ = (seller_pubkey, payment_method);
+        let _ = (listed_by, payment_method);
         let view = trade.view();
         save(&self.path, &market).map_err(OrderError::Save)?;
         eprintln!(
@@ -611,9 +664,9 @@ impl MarketStore {
 
     pub fn post_chat(&self, id: &str, body: &PostChatBody) -> Result<TradeView, OrderError> {
         let from = body.from.trim().to_ascii_lowercase();
-        if from != "buyer" && from != "seller" {
+        if from != "lister" && from != "taker" && from != "buyer" && from != "seller" {
             return Err(OrderError::BadState(
-                "chat from must be buyer or seller".into(),
+                "chat from must be lister or taker".into(),
             ));
         }
         let text = body.text.trim();
@@ -1079,11 +1132,30 @@ fn ad_has_open_trade(market: &Market, ad: &Ad) -> bool {
         .is_some_and(Trade::is_open)
 }
 
+fn ad_is_shoppable(market: &Market, ad: &Ad) -> bool {
+    !ad.cancelled && !ad_has_open_trade(market, ad) && can_fill_min(ad)
+}
+
+fn can_fill_min(ad: &Ad) -> bool {
+    if parse_available(&ad.available).is_ok_and(|value| value == 0) {
+        return false;
+    }
+    if ad.min.trim().is_empty() {
+        return parse_available(&ad.available).is_ok_and(|value| value > 0);
+    }
+    match ckb_from_fiat(&ad.min, &ad.price) {
+        Ok(min_ckb) => {
+            cmp_ckb(&ad.available, &min_ckb).is_ok_and(|order| order != std::cmp::Ordering::Less)
+        }
+        Err(_) => false,
+    }
+}
+
 fn return_ckb(market: &mut Market, ad_id: &str, trade_id: &str, amount: &str) -> Result<(), OrderError> {
     let Some(ad) = market.ads.get_mut(ad_id) else {
         return Ok(());
     };
-    ad.available_ckb = add_ckb(&ad.available_ckb, amount).map_err(OrderError::BadAmount)?;
+    ad.available = add_ckb(&ad.available, amount).map_err(OrderError::BadAmount)?;
     if ad.open_trade_id.as_deref() == Some(trade_id) {
         ad.open_trade_id = None;
     }
@@ -1121,5 +1193,33 @@ fn save(path: &Path, market: &Market) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, text).map_err(|err| err.to_string())?;
     fs::rename(&tmp, path).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn ad(available: &str, min: &str) -> Ad {
+        Ad {
+            id: "ad1".into(),
+            pubkey: "aa".into(),
+            available: available.into(),
+            currency: "NGN".into(),
+            price: "2000".into(),
+            min: min.into(),
+            max: "4000".into(),
+            payment_method: "Opay".into(),
+            cancelled: false,
+            open_trade_id: None,
+        }
+    }
+
+    #[test]
+    fn leftover_below_min_is_not_shoppable() {
+        let market = Market::default();
+        assert!(ad_is_shoppable(&market, &ad("1", "2000")));
+        assert!(!ad_is_shoppable(&market, &ad("0.5", "2000")));
+        assert!(!ad_is_shoppable(&market, &ad("0", "2000")));
+    }
 }
 

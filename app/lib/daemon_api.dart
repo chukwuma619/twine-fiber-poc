@@ -22,20 +22,22 @@ class DaemonApi {
 
   Future<AdSnapshot> createAd(
     String baseUrl, {
-    required String sellerPubkey,
-    required String sellerName,
-    required String availableCkb,
-    required String fiat,
-    required String rate,
+    required String pubkey,
+    required String available,
+    required String currency,
+    required String price,
+    required String min,
+    required String max,
     required String paymentMethod,
   }) async {
     return AdSnapshot.fromJson(
       await _postMap(baseUrl, '/ads', {
-        'seller_pubkey': sellerPubkey,
-        'seller_name': sellerName,
-        'available_ckb': availableCkb,
-        'fiat': fiat,
-        'rate': rate,
+        'pubkey': pubkey,
+        'available': available,
+        'currency': currency,
+        'price': price,
+        'min': min,
+        'max': max,
         'payment_method': paymentMethod,
       }),
     );
@@ -68,15 +70,13 @@ class DaemonApi {
   Future<TradeSnapshot> createTrade(
     String baseUrl, {
     required String adId,
-    required String buyerPubkey,
-    required String buyerName,
-    required String fiatAmount,
+    required String taker,
+    required String payAmount,
   }) async {
     return _trade(baseUrl, '/trades', {
       'ad_id': adId,
-      'buyer_pubkey': buyerPubkey,
-      'buyer_name': buyerName,
-      'fiat_amount': fiatAmount,
+      'taker': taker,
+      'pay_amount': payAmount,
     });
   }
 

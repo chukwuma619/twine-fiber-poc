@@ -34,17 +34,36 @@ String formatDecimal8(BigInt scaled) {
   return '$whole.${digits.replaceFirst(RegExp(r'0+$'), '')}';
 }
 
-String ckbFromFiat(String fiat, String rate) {
-  final fiatValue = shannonsFromDecimal(fiat);
-  final rateValue = shannonsFromDecimal(rate);
-  if (rateValue == BigInt.zero) {
-    throw const FormatException('rate must be greater than zero');
+String ckbFromPay(String pay, String price) {
+  final payValue = shannonsFromDecimal(pay);
+  final priceValue = shannonsFromDecimal(price);
+  if (priceValue == BigInt.zero) {
+    throw const FormatException('price must be greater than zero');
   }
-  final ckb = (fiatValue * BigInt.from(shannonsPerCkb)) ~/ rateValue;
+  final ckb = (payValue * BigInt.from(shannonsPerCkb)) ~/ priceValue;
   if (ckb == BigInt.zero) {
-    throw const FormatException('fiat amount is too small for this rate');
+    throw const FormatException('amount is too small for this price');
   }
   return formatDecimal8(ckb);
+}
+
+String payFromCkb(String ckb, String price) {
+  final ckbValue = shannonsFromDecimal(ckb);
+  final priceValue = shannonsFromDecimal(price);
+  if (priceValue == BigInt.zero) {
+    throw const FormatException('price must be greater than zero');
+  }
+  final pay = (ckbValue * priceValue) ~/ BigInt.from(shannonsPerCkb);
+  return formatDecimal8(pay);
+}
+
+int compareAmount(String left, String right) {
+  return shannonsFromDecimal(left).compareTo(shannonsFromDecimal(right));
+}
+
+String takeCap(String maxPay, String available, String price) {
+  final availablePay = payFromCkb(available, price);
+  return compareAmount(maxPay, availablePay) <= 0 ? maxPay : availablePay;
 }
 
 String shannonHex(String ckb) {

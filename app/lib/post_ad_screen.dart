@@ -22,13 +22,20 @@ class PostAdScreen extends StatefulWidget {
 
 class _PostAdScreenState extends State<PostAdScreen> {
   final TextEditingController _amount = TextEditingController();
-  final TextEditingController _fiat = TextEditingController(text: 'NGN');
-  final TextEditingController _rate = TextEditingController();
+  final TextEditingController _currency = TextEditingController(text: 'NGN');
+  final TextEditingController _price = TextEditingController();
+  final TextEditingController _min = TextEditingController();
+  final TextEditingController _max = TextEditingController();
   final TextEditingController _method = TextEditingController(text: 'Opay');
   String? _error;
   var _busy = false;
 
   UserSettings get _user => widget.settings.settings;
+
+  String get _currencyCode {
+    final text = _currency.text.trim();
+    return text.isEmpty ? 'NGN' : text.toUpperCase();
+  }
 
   Future<void> _submit() async {
     setState(() {
@@ -43,11 +50,12 @@ class _PostAdScreenState extends State<PostAdScreen> {
       }
       await widget.daemon.createAd(
         _user.daemonUrl,
-        sellerPubkey: pubkey,
-        sellerName: _user.name.trim().isEmpty ? 'Seller' : _user.name.trim(),
-        availableCkb: _amount.text,
-        fiat: _fiat.text,
-        rate: _rate.text,
+        pubkey: pubkey,
+        available: _amount.text,
+        currency: _currencyCode,
+        price: _price.text,
+        min: _min.text,
+        max: _max.text,
         paymentMethod: _method.text,
       );
       if (!mounted) {
@@ -68,8 +76,10 @@ class _PostAdScreenState extends State<PostAdScreen> {
   @override
   void dispose() {
     _amount.dispose();
-    _fiat.dispose();
-    _rate.dispose();
+    _currency.dispose();
+    _price.dispose();
+    _min.dispose();
+    _max.dispose();
     _method.dispose();
     super.dispose();
   }
@@ -84,24 +94,45 @@ class _PostAdScreenState extends State<PostAdScreen> {
           TextField(
             key: const Key('ad-amount'),
             controller: _amount,
-            decoration: const InputDecoration(labelText: 'CKB for sale'),
+            decoration: const InputDecoration(labelText: 'Available'),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
           ),
           TextField(
-            key: const Key('ad-fiat'),
-            controller: _fiat,
-            decoration: const InputDecoration(labelText: 'Fiat label'),
+            key: const Key('ad-currency'),
+            controller: _currency,
+            decoration: const InputDecoration(
+              labelText: 'Currency',
+              hintText: 'NGN, GHS, USD…',
+            ),
+            textCapitalization: TextCapitalization.characters,
           ),
           TextField(
-            key: const Key('ad-rate'),
-            controller: _rate,
-            decoration: const InputDecoration(labelText: 'Rate (fiat per 1 CKB)'),
+            key: const Key('ad-price'),
+            controller: _price,
+            decoration: const InputDecoration(
+              labelText: 'Price',
+              hintText: 'for 1 CKB',
+            ),
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          ),
+          TextField(
+            key: const Key('ad-min'),
+            controller: _min,
+            decoration: const InputDecoration(labelText: 'Min per trade'),
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          ),
+          TextField(
+            key: const Key('ad-max'),
+            controller: _max,
+            decoration: const InputDecoration(labelText: 'Max per trade'),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
           ),
           TextField(
             key: const Key('ad-method'),
             controller: _method,
-            decoration: const InputDecoration(labelText: 'Payment method'),
+            decoration: const InputDecoration(
+              labelText: 'Payment (rail and handle)',
+            ),
           ),
           const SizedBox(height: 16),
           FilledButton(

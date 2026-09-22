@@ -13,19 +13,45 @@ class TakeAdDialog extends StatefulWidget {
 }
 
 class _TakeAdDialogState extends State<TakeAdDialog> {
-  final TextEditingController _fiat = TextEditingController();
+  final TextEditingController _pay = TextEditingController();
   String? _ckb;
   String? _error;
 
   @override
   void dispose() {
-    _fiat.dispose();
+    _pay.dispose();
     super.dispose();
   }
 
   void _recompute() {
+    final ad = widget.ad;
+    final pay = _pay.text.trim();
     try {
-      final ckb = ckbFromFiat(_fiat.text, widget.ad.rate);
+      if (pay.isEmpty) {
+        setState(() {
+          _ckb = null;
+          _error = null;
+        });
+        return;
+      }
+      if (ad.min.isNotEmpty && compareAmount(pay, ad.min) < 0) {
+        setState(() {
+          _ckb = null;
+          _error = 'Minimum is ${ad.min} ${ad.currency}';
+        });
+        return;
+      }
+      final cap = ad.max.isEmpty
+          ? payFromCkb(ad.available, ad.price)
+          : takeCap(ad.max, ad.available, ad.price);
+      if (compareAmount(pay, cap) > 0) {
+        setState(() {
+          _ckb = null;
+          _error = 'Maximum is $cap ${ad.currency}';
+        });
+        return;
+      }
+      final ckb = ckbFromPay(pay, ad.price);
       setState(() {
         _ckb = ckb;
         _error = null;
@@ -40,19 +66,22 @@ class _TakeAdDialogState extends State<TakeAdDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final ad = widget.ad;
     return AlertDialog(
-      title: Text('Buy from ${widget.ad.sellerName}'),
+      title: const Text('Take offer'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Rate ${widget.ad.rate} ${widget.ad.fiat} per CKB'),
+          Text('Currency ${ad.currency}'),
+          Text('Price ${ad.price} per CKB'),
+          Text('Available ${ad.available} CKB'),
+          if (ad.min.isNotEmpty && ad.max.isNotEmpty)
+            Text('Limit ${ad.min}–${ad.max}'),
           TextField(
-            key: const Key('fiat-amount'),
-            controller: _fiat,
-            decoration: InputDecoration(
-              labelText: 'Fiat amount (${widget.ad.fiat})',
-            ),
+            key: const Key('pay-amount'),
+            controller: _pay,
+            decoration: const InputDecoration(labelText: 'You pay'),
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             onChanged: (_) => _recompute(),
           ),
@@ -70,7 +99,7 @@ class _TakeAdDialogState extends State<TakeAdDialog> {
           key: const Key('start-trade'),
           onPressed: _ckb == null
               ? null
-              : () => Navigator.of(context).pop(_fiat.text.trim()),
+              : () => Navigator.of(context).pop(_pay.text.trim()),
           child: const Text('Start trade'),
         ),
       ],

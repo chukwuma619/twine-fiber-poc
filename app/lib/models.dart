@@ -31,34 +31,37 @@ class ChatLine {
 class AdSnapshot {
   const AdSnapshot({
     required this.id,
-    required this.sellerPubkey,
-    required this.sellerName,
-    required this.availableCkb,
-    required this.fiat,
-    required this.rate,
+    required this.pubkey,
+    required this.available,
+    required this.currency,
+    required this.price,
+    required this.min,
+    required this.max,
     required this.paymentMethod,
     this.openTradeId,
   });
 
   final String id;
-  final String sellerPubkey;
-  final String sellerName;
-  final String availableCkb;
-  final String fiat;
-  final String rate;
+  final String pubkey;
+  final String available;
+  final String currency;
+  final String price;
+  final String min;
+  final String max;
   final String paymentMethod;
   final String? openTradeId;
 
-  bool isMine(String? pubkey) => samePubkey(sellerPubkey, pubkey);
+  bool isMine(String? other) => samePubkey(pubkey, other);
 
   factory AdSnapshot.fromJson(Map<String, dynamic> json) {
     return AdSnapshot(
       id: json['id'] as String? ?? '',
-      sellerPubkey: json['seller_pubkey'] as String? ?? '',
-      sellerName: json['seller_name'] as String? ?? '',
-      availableCkb: json['available_ckb'] as String? ?? '',
-      fiat: json['fiat'] as String? ?? 'NGN',
-      rate: json['rate'] as String? ?? '',
+      pubkey: _field(json, const ['pubkey', 'seller_pubkey']),
+      available: _field(json, const ['available', 'available_ckb']),
+      currency: _field(json, const ['currency', 'fiat'], 'NGN'),
+      price: _field(json, const ['price', 'rate']),
+      min: _field(json, const ['min', 'min_fiat']),
+      max: _field(json, const ['max', 'max_fiat']),
       paymentMethod: json['payment_method'] as String? ?? '',
       openTradeId: json['open_trade_id'] as String?,
     );
@@ -69,13 +72,11 @@ class TradeSnapshot {
   const TradeSnapshot({
     required this.id,
     required this.adId,
-    required this.sellerPubkey,
-    required this.sellerName,
-    required this.buyerPubkey,
-    required this.buyerName,
-    required this.fiat,
-    required this.rate,
-    required this.fiatAmount,
+    required this.pubkey,
+    required this.taker,
+    required this.currency,
+    required this.price,
+    required this.payAmount,
     required this.amount,
     required this.paymentMethod,
     required this.state,
@@ -89,13 +90,11 @@ class TradeSnapshot {
 
   final String id;
   final String adId;
-  final String sellerPubkey;
-  final String sellerName;
-  final String buyerPubkey;
-  final String buyerName;
-  final String fiat;
-  final String rate;
-  final String fiatAmount;
+  final String pubkey;
+  final String taker;
+  final String currency;
+  final String price;
+  final String payAmount;
   final String amount;
   final String paymentMethod;
   final String state;
@@ -138,21 +137,19 @@ class TradeSnapshot {
     }
   }
 
-  bool isSeller(String? pubkey) => samePubkey(sellerPubkey, pubkey);
+  bool isLister(String? other) => samePubkey(pubkey, other);
 
-  bool isBuyer(String? pubkey) => samePubkey(buyerPubkey, pubkey);
+  bool isTaker(String? other) => samePubkey(taker, other);
 
   factory TradeSnapshot.fromJson(Map<String, dynamic> json) {
     return TradeSnapshot(
       id: json['id'] as String? ?? '',
       adId: json['ad_id'] as String? ?? '',
-      sellerPubkey: json['seller_pubkey'] as String? ?? '',
-      sellerName: json['seller_name'] as String? ?? '',
-      buyerPubkey: json['buyer_pubkey'] as String? ?? '',
-      buyerName: json['buyer_name'] as String? ?? '',
-      fiat: json['fiat'] as String? ?? '',
-      rate: json['rate'] as String? ?? '',
-      fiatAmount: json['fiat_amount'] as String? ?? '',
+      pubkey: _field(json, const ['pubkey', 'seller_pubkey']),
+      taker: _field(json, const ['taker', 'buyer_pubkey']),
+      currency: _field(json, const ['currency', 'fiat']),
+      price: _field(json, const ['price', 'rate']),
+      payAmount: _field(json, const ['pay_amount', 'fiat_amount']),
       amount: json['amount'] as String? ?? '',
       paymentMethod: json['payment_method'] as String? ?? '',
       state: json['state'] as String? ?? 'Idle',
@@ -247,6 +244,16 @@ class FiberException implements Exception {
 
   @override
   String toString() => message;
+}
+
+String _field(Map<String, dynamic> json, List<String> keys, [String fallback = '']) {
+  for (final key in keys) {
+    final value = json[key];
+    if (value is String && value.isNotEmpty) {
+      return value;
+    }
+  }
+  return fallback;
 }
 
 List<T> _lines<T>(

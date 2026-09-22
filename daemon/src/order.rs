@@ -26,13 +26,16 @@ pub const HOLD_EXPIRY_POLL: Duration = Duration::from_secs(15);
 pub struct Trade {
     pub id: String,
     pub ad_id: String,
-    pub seller_pubkey: String,
-    pub seller_name: String,
-    pub buyer_pubkey: String,
-    pub buyer_name: String,
-    pub fiat: String,
-    pub rate: String,
-    pub fiat_amount: String,
+    #[serde(alias = "seller_pubkey")]
+    pub pubkey: String,
+    #[serde(alias = "buyer_pubkey")]
+    pub taker: String,
+    #[serde(alias = "fiat")]
+    pub currency: String,
+    #[serde(alias = "rate")]
+    pub price: String,
+    #[serde(alias = "fiat_amount")]
+    pub pay_amount: String,
     pub amount: String,
     pub payment_method: String,
     pub state: OrderState,
@@ -56,13 +59,11 @@ pub struct Trade {
 pub struct TradeView {
     pub id: String,
     pub ad_id: String,
-    pub seller_pubkey: String,
-    pub seller_name: String,
-    pub buyer_pubkey: String,
-    pub buyer_name: String,
-    pub fiat: String,
-    pub rate: String,
-    pub fiat_amount: String,
+    pub pubkey: String,
+    pub taker: String,
+    pub currency: String,
+    pub price: String,
+    pub pay_amount: String,
     pub amount: String,
     pub payment_method: String,
     pub state: OrderState,
@@ -93,13 +94,11 @@ impl Trade {
         TradeView {
             id: self.id.clone(),
             ad_id: self.ad_id.clone(),
-            seller_pubkey: self.seller_pubkey.clone(),
-            seller_name: self.seller_name.clone(),
-            buyer_pubkey: self.buyer_pubkey.clone(),
-            buyer_name: self.buyer_name.clone(),
-            fiat: self.fiat.clone(),
-            rate: self.rate.clone(),
-            fiat_amount: self.fiat_amount.clone(),
+            pubkey: self.pubkey.clone(),
+            taker: self.taker.clone(),
+            currency: self.currency.clone(),
+            price: self.price.clone(),
+            pay_amount: self.pay_amount.clone(),
             amount: self.amount.clone(),
             payment_method: self.payment_method.clone(),
             state: self.state,
@@ -189,20 +188,28 @@ pub enum OrderError {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAdBody {
-    pub seller_pubkey: String,
-    pub seller_name: String,
-    pub available_ckb: String,
-    pub fiat: Option<String>,
-    pub rate: String,
+    #[serde(alias = "seller_pubkey")]
+    pub pubkey: String,
+    #[serde(alias = "available_ckb")]
+    pub available: String,
+    #[serde(alias = "fiat")]
+    pub currency: Option<String>,
+    #[serde(alias = "rate")]
+    pub price: String,
+    #[serde(alias = "min_fiat")]
+    pub min: String,
+    #[serde(alias = "max_fiat")]
+    pub max: String,
     pub payment_method: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTradeBody {
     pub ad_id: String,
-    pub buyer_pubkey: String,
-    pub buyer_name: String,
-    pub fiat_amount: String,
+    #[serde(alias = "buyer_pubkey")]
+    pub taker: String,
+    #[serde(alias = "fiat_amount")]
+    pub pay_amount: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -630,6 +637,19 @@ pub fn ckb_from_fiat(fiat: &str, rate: &str) -> Result<String, String> {
     Ok(format_decimal_8(ckb))
 }
 
+pub fn fiat_from_ckb(ckb: &str, rate: &str) -> Result<String, String> {
+    let ckb = parse_decimal_8(ckb)?;
+    let rate = parse_decimal_8(rate)?;
+    if rate == 0 {
+        return Err("rate must be greater than zero".to_string());
+    }
+    let fiat = ckb
+        .checked_mul(rate)
+        .and_then(|v| v.checked_div(SHANNONS_PER_CKB))
+        .ok_or_else(|| "amount is too large".to_string())?;
+    Ok(format_decimal_8(fiat))
+}
+
 pub fn add_ckb(left: &str, right: &str) -> Result<String, String> {
     let sum = parse_decimal_8(left)?
         .checked_add(parse_decimal_8(right)?)
@@ -714,6 +734,8 @@ mod tests {
     fn fiat_over_rate_is_integer_shannon_ckb() {
         assert_eq!(ckb_from_fiat("2000", "2000").as_deref(), Ok("1"));
         assert_eq!(ckb_from_fiat("1000", "2000").as_deref(), Ok("0.5"));
+        assert_eq!(fiat_from_ckb("1", "2000").as_deref(), Ok("2000"));
+        assert_eq!(fiat_from_ckb("0.5", "2000").as_deref(), Ok("1000"));
         assert!(ckb_from_fiat("1", "200000000000").is_err());
         assert!(ckb_from_fiat("10", "0").is_err());
     }
@@ -728,5 +750,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "poc_test.rs"]
 mod poc_test;

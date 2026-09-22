@@ -28,22 +28,42 @@ class OfferCard extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                mine ? 'YOUR OFFER' : 'SELLING',
-                style: TextStyle(
-                  color: muted,
-                  fontSize: 12,
-                  letterSpacing: 0.6,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                ad.sellerName,
-                style: TextStyle(color: muted, fontSize: 13),
+              Row(
+                children: [
+                  if (mine)
+                    Text(
+                      'YOUR OFFER',
+                      style: TextStyle(
+                        color: muted,
+                        fontSize: 12,
+                        letterSpacing: 0.6,
+                      ),
+                    )
+                  else
+                    const SizedBox.shrink(),
+                  const Spacer(),
+                  Text(
+                    ad.currency,
+                    style: TextStyle(
+                      color: muted,
+                      fontSize: 12,
+                      letterSpacing: 0.6,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'CKB',
+                    style: TextStyle(
+                      color: muted,
+                      fontSize: 12,
+                      letterSpacing: 0.6,
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 10),
               Text(
-                '${ad.availableCkb} CKB',
+                ad.price,
                 style: const TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.w600,
@@ -51,9 +71,20 @@ class OfferCard extends StatelessWidget {
                 ),
               ),
               Text(
-                '${ad.rate} ${ad.fiat} / CKB',
+                'per CKB',
                 style: TextStyle(color: muted, fontSize: 14),
               ),
+              Text(
+                'Available ${ad.available} CKB',
+                style: TextStyle(color: muted, fontSize: 14),
+              ),
+              if (ad.min.isNotEmpty && ad.max.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  'Limit ${ad.min}–${ad.max}',
+                  style: TextStyle(color: muted, fontSize: 14),
+                ),
+              ],
               const SizedBox(height: 14),
               Row(
                 children: [
@@ -69,14 +100,6 @@ class OfferCard extends StatelessWidget {
                       style: const TextStyle(fontSize: 14),
                     ),
                   ),
-                  if (onTake != null)
-                    Text(
-                      'Buy',
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.primary,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
                 ],
               ),
             ],

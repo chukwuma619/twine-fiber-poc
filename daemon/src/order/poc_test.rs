@@ -13,8 +13,9 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{
-    BuyerInvoiceBody, CreateAdBody, CreateTradeBody, OrderError, OrderState, PostChatBody, TradeView,
+use crate::order::{
+    BuyerInvoiceBody, CreateAdBody, CreateTradeBody, OrderError, OrderState, PostChatBody,
+    TradeView, fiat_from_ckb,
 };
 use crate::health::Config;
 use crate::market::MarketStore;
@@ -277,7 +278,7 @@ async fn walks_hold_release_dispute_and_expiry() {
         .iter()
         .find(|ad| ad.id == seller_case.ad_id)
         .expect("ad remains after expiry");
-    assert_eq!(restored.available_ckb, "1");
+    assert_eq!(restored.available, "1");
     let next = start_trade_on(&store, &rpc, &config, &seller_case.ad_id)
         .await
         .unwrap();
@@ -320,13 +321,100 @@ async fn ad_reserve_blocks_second_take_and_returns_on_cancel() {
         .into_iter()
         .find(|listed| listed.id == ad.id)
         .expect("cancelled trade returns CKB to the ad");
-    assert_eq!(restored.available_ckb, "1");
+    assert_eq!(restored.available, "1");
 
     let second = start_trade_on(&store, &rpc, &config, &ad.id)
         .await
         .unwrap();
     assert_eq!(second.state, OrderState::WaitingHold);
     assert!(!store.list_ads().iter().any(|listed| listed.id == ad.id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_take_locks_the_slice_and_hides_dust() {
+    let path = temp_path();
+    let _remove = RemoveFile(path.clone());
+    let fiber = Arc::new(Mutex::new(FiberNode::new()));
+    let config = serve(Arc::clone(&fiber)).await;
+    let rpc = FiberRpc::new();
+    let store = MarketStore::open(path).unwrap();
+
+    assert!(matches!(
+        store.create_ad(&CreateAdBody {
+            pubkey: SELLER.into(),
+            available: "1".into(),
+            currency: Some("NGN".into()),
+            price: "2000".into(),
+            min: "3000".into(),
+            max: "4000".into(),
+            payment_method: "Opay".into(),
+        }),
+        Err(OrderError::BadAmount(_))
+    ));
+
+    let ad = store
+        .create_ad(&CreateAdBody {
+            pubkey: SELLER.into(),
+            available: "2".into(),
+            currency: Some("NGN".into()),
+            price: "2000".into(),
+            min: "2000".into(),
+            max: "3000".into(),
+            payment_method: "Opay".into(),
+        })
+        .unwrap();
+    assert_eq!(ad.min, "2000");
+    assert_eq!(ad.max, "3000");
+
+    let too_small = store
+        .create_trade(
+            &rpc,
+            &config,
+            &CreateTradeBody {
+                ad_id: ad.id.clone(),
+                taker: BUYER.into(),
+                pay_amount: "1000".into(),
+            },
+        )
+        .await;
+    assert!(matches!(too_small, Err(OrderError::BadAmount(_))));
+
+    let too_big = store
+        .create_trade(
+            &rpc,
+            &config,
+            &CreateTradeBody {
+                ad_id: ad.id.clone(),
+                taker: BUYER.into(),
+                pay_amount: "4000".into(),
+            },
+        )
+        .await;
+    assert!(matches!(too_big, Err(OrderError::BadAmount(_))));
+
+    let first = store
+        .create_trade(
+            &rpc,
+            &config,
+            &CreateTradeBody {
+                ad_id: ad.id.clone(),
+                taker: BUYER.into(),
+                pay_amount: "2000".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.amount, "1");
+    assert!(!store.list_ads().iter().any(|listed| listed.id == ad.id));
+
+    let cancelled = store.try_cancel(&first.id, &rpc, &config).await.unwrap();
+    assert_eq!(cancelled.state, OrderState::Cancelled);
+    let restored = store
+        .list_ads()
+        .into_iter()
+        .find(|listed| listed.id == ad.id)
+        .expect("cancelled slice returns CKB to the ad");
+    assert_eq!(restored.available, "2");
 }
 
 async fn open_dispute(
@@ -373,9 +461,8 @@ async fn start_trade_on(
             config,
             &CreateTradeBody {
                 ad_id: ad_id.into(),
-                buyer_pubkey: BUYER.into(),
-                buyer_name: "Ben".into(),
-                fiat_amount: "2000".into(),
+                taker: BUYER.into(),
+                pay_amount: "2000".into(),
             },
         )
         .await
@@ -384,11 +471,12 @@ async fn start_trade_on(
 fn post_ad(store: &MarketStore, available: &str) -> crate::market::AdView {
     store
         .create_ad(&CreateAdBody {
-            seller_pubkey: SELLER.into(),
-            seller_name: "Ada".into(),
-            available_ckb: available.into(),
-            fiat: Some("NGN".into()),
-            rate: "2000".into(),
+            pubkey: SELLER.into(),
+            available: available.into(),
+            currency: Some("NGN".into()),
+            price: "2000".into(),
+            min: "2000".into(),
+            max: fiat_from_ckb(available, "2000").expect("listing pay cap"),
             payment_method: "Opay".into(),
         })
         .unwrap()

@@ -10,17 +10,18 @@ import 'package:twine_app/main.dart';
 import 'package:twine_app/settings.dart';
 import 'package:twine_app/trade_screen.dart';
 
-const seller = '02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-const buyer = '02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const lister = '02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const taker = '02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
 Map<String, dynamic> adJson() {
   return {
     'id': 'ad1',
-    'seller_pubkey': seller,
-    'seller_name': 'Ada',
-    'available_ckb': '1',
-    'fiat': 'NGN',
-    'rate': '2000',
+    'pubkey': lister,
+    'available': '1',
+    'currency': 'NGN',
+    'price': '2000',
+    'min': '1000',
+    'max': '2000',
     'payment_method': 'Opay',
     'open_trade_id': null,
   };
@@ -28,19 +29,17 @@ Map<String, dynamic> adJson() {
 
 Map<String, dynamic> tradeJson({
   required String state,
-  required String sellerPubkey,
-  required String buyerPubkey,
+  required String pubkey,
+  required String taker,
 }) {
   return {
     'id': 't1',
     'ad_id': 'ad1',
-    'seller_pubkey': sellerPubkey,
-    'seller_name': 'Ada',
-    'buyer_pubkey': buyerPubkey,
-    'buyer_name': 'Ben',
-    'fiat': 'NGN',
-    'rate': '2000',
-    'fiat_amount': '2000',
+    'pubkey': pubkey,
+    'taker': taker,
+    'currency': 'NGN',
+    'price': '2000',
+    'pay_amount': '2000',
     'amount': '1',
     'payment_method': 'Opay',
     'state': state,
@@ -83,7 +82,7 @@ void main() {
           initial: const UserSettings(
             name: 'Ben',
             daemonUrl: 'http://127.0.0.1:8080',
-            pubkey: buyer,
+            pubkey: taker,
           ),
         ),
       ),
@@ -93,10 +92,13 @@ void main() {
 
     expect(find.text('BUY CKB'), findsOneWidget);
     expect(find.text('Order book'), findsOneWidget);
-    expect(find.text('SELLING'), findsOneWidget);
-    expect(find.text('Ada'), findsOneWidget);
-    expect(find.text('1 CKB'), findsOneWidget);
-    expect(find.text('2000 NGN / CKB'), findsOneWidget);
+    expect(find.text('SELL CKB'), findsOneWidget);
+    expect(find.text('CKB'), findsOneWidget);
+    expect(find.text('Available 1 CKB'), findsOneWidget);
+    expect(find.text('NGN'), findsOneWidget);
+    expect(find.text('2000'), findsOneWidget);
+    expect(find.text('per CKB'), findsOneWidget);
+    expect(find.text('Limit 1000–2000'), findsOneWidget);
     expect(find.textContaining('Opay'), findsOneWidget);
     expect(find.byKey(const Key('take-ad1')), findsOneWidget);
 
@@ -106,7 +108,7 @@ void main() {
     expect(find.textContaining('You have no sell offers'), findsOneWidget);
   });
 
-  testWidgets('trade shows Lock only to the seller and Fiat sent only to the buyer', (
+  testWidgets('trade shows Lock only to the lister and Fiat sent only to the taker', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(800, 1600));
@@ -118,8 +120,8 @@ void main() {
         return jsonOk(
           tradeJson(
             state: state,
-            sellerPubkey: seller,
-            buyerPubkey: buyer,
+            pubkey: lister,
+            taker: taker,
           ),
         );
       }
@@ -150,13 +152,13 @@ void main() {
       await tester.pump(const Duration(milliseconds: 50));
     }
 
-    await openAs(seller);
+    await openAs(lister);
     expect(find.text('WaitingHold'), findsOneWidget);
     expect(find.byKey(const Key('lock')), findsOneWidget);
     expect(find.byKey(const Key('fiat-sent')), findsNothing);
 
     state = 'WaitingFiat';
-    await openAs(buyer);
+    await openAs(taker);
     expect(find.text('WaitingFiat'), findsOneWidget);
     expect(find.byKey(const Key('lock')), findsNothing);
     expect(find.byKey(const Key('fiat-sent')), findsOneWidget);

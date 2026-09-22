@@ -130,11 +130,11 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   Future<void> _take(AdSnapshot ad) async {
-    final fiat = await showDialog<String>(
+    final pay = await showDialog<String>(
       context: context,
       builder: (context) => TakeAdDialog(ad: ad),
     );
-    if (fiat == null || !mounted) {
+    if (pay == null || !mounted) {
       return;
     }
     final pubkey = _user.pubkey;
@@ -152,9 +152,8 @@ class _HomeShellState extends State<HomeShell> {
       final trade = await widget.daemon.createTrade(
         _user.daemonUrl,
         adId: ad.id,
-        buyerPubkey: pubkey,
-        buyerName: _user.name.trim().isEmpty ? 'Buyer' : _user.name.trim(),
-        fiatAmount: fiat,
+        taker: pubkey,
+        payAmount: pay,
       );
       if (!mounted) {
         return;
@@ -314,7 +313,7 @@ class _HomeShellState extends State<HomeShell> {
           child: ListTile(
             title: Text('${trade.amount} CKB · ${trade.state}'),
             subtitle: Text(
-              '${trade.sellerName} → ${trade.buyerName} · ${trade.fiatAmount} ${trade.fiat}',
+              '${trade.payAmount} ${trade.currency}',
             ),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => _openTrade(trade.id),

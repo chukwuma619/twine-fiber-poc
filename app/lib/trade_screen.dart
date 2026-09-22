@@ -201,11 +201,11 @@ class _TradeScreenState extends State<TradeScreen> {
   }
 
   String _sideLabel(TradeSnapshot trade) {
-    if (trade.isSeller(_user.pubkey)) {
-      return 'You are the seller';
+    if (trade.isLister(_user.pubkey)) {
+      return 'You listed this';
     }
-    if (trade.isBuyer(_user.pubkey)) {
-      return 'You are the buyer';
+    if (trade.isTaker(_user.pubkey)) {
+      return 'You took this';
     }
     return 'Watching this trade';
   }
@@ -213,10 +213,10 @@ class _TradeScreenState extends State<TradeScreen> {
   @override
   Widget build(BuildContext context) {
     final trade = _trade;
-    final seller = trade?.isSeller(_user.pubkey) ?? false;
-    final buyer = trade?.isBuyer(_user.pubkey) ?? false;
+    final listed = trade?.isLister(_user.pubkey) ?? false;
+    final took = trade?.isTaker(_user.pubkey) ?? false;
     final operator = _user.operatorTools;
-    final canChat = (buyer || seller) && (trade?.isDisputed ?? false) && !_busy;
+    final canChat = (took || listed) && (trade?.isDisputed ?? false) && !_busy;
     final chatReady = canChat && _chat.text.trim().isNotEmpty;
     final stateLabel = _loading ? 'Loading' : (trade?.state ?? 'Idle');
 
@@ -227,7 +227,7 @@ class _TradeScreenState extends State<TradeScreen> {
         children: [
           if (trade != null) Text(_sideLabel(trade)),
           const SizedBox(height: 8),
-          if (seller && (trade?.isWaitingHold ?? false))
+          if (listed && (trade?.isWaitingHold ?? false))
             FilledButton(
               key: const Key('lock'),
               onPressed: _busy
@@ -245,7 +245,7 @@ class _TradeScreenState extends State<TradeScreen> {
                     }),
               child: const Text('Lock'),
             ),
-          if (buyer && (trade?.isWaitingFiat ?? false)) ...[
+          if (took && (trade?.isWaitingFiat ?? false)) ...[
             const SizedBox(height: 8),
             FilledButton(
               key: const Key('fiat-sent'),
@@ -262,7 +262,7 @@ class _TradeScreenState extends State<TradeScreen> {
               child: const Text('Fiat sent'),
             ),
           ],
-          if (seller &&
+          if (listed &&
               ((trade?.isFiatSent ?? false) || (trade?.isReleasing ?? false))) ...[
             const SizedBox(height: 8),
             FilledButton(
@@ -290,7 +290,7 @@ class _TradeScreenState extends State<TradeScreen> {
               'Do not cancel the held invoice.',
               key: Key('leg2-failed-message'),
             ),
-            if (buyer) ...[
+            if (took) ...[
               const SizedBox(height: 8),
               FilledButton(
                 key: const Key('retry'),
@@ -308,7 +308,7 @@ class _TradeScreenState extends State<TradeScreen> {
               ),
             ],
           ],
-          if ((buyer || seller) && (trade?.canOpenDispute ?? false)) ...[
+          if ((took || listed) && (trade?.canOpenDispute ?? false)) ...[
             const SizedBox(height: 8),
             OutlinedButton(
               key: const Key('open-dispute'),
@@ -337,7 +337,7 @@ class _TradeScreenState extends State<TradeScreen> {
                     key: const Key('chat-line'),
                   ),
                 ),
-            if (buyer || seller) ...[
+            if (took || listed) ...[
               const SizedBox(height: 8),
               TextField(
                 key: const Key('chat-input'),
@@ -356,7 +356,7 @@ class _TradeScreenState extends State<TradeScreen> {
                           () => widget.daemon.postChat(
                             _user.daemonUrl,
                             widget.tradeId,
-                            from: buyer ? 'buyer' : 'seller',
+                            from: took ? 'taker' : 'lister',
                             text: text,
                           ),
                         );
@@ -372,7 +372,7 @@ class _TradeScreenState extends State<TradeScreen> {
                 onPressed: _busy
                     ? null
                     : () => _run(() async {
-                        final invoice = buyer
+                        final invoice = took
                             ? await _buyerInvoice()
                             : (trade.buyerInvoice ??
                                 (throw const DaemonException(
@@ -424,7 +424,9 @@ class _TradeScreenState extends State<TradeScreen> {
           Text(stateLabel, key: const Key('order-state')),
           if (trade != null) ...[
             Text('Amount: ${trade.amount} CKB'),
-            Text('Fiat: ${trade.fiatAmount} ${trade.fiat} at ${trade.rate}'),
+            Text('Currency: ${trade.currency}'),
+            Text('Price: ${trade.price} per CKB'),
+            Text('You pay: ${trade.payAmount}'),
             Text('Payment: ${trade.paymentMethod}'),
             if (trade.invoiceStatus != null) Text('Invoice: ${trade.invoiceStatus}'),
             if (trade.paymentHash != null) Text('H: ${trade.paymentHash}'),
