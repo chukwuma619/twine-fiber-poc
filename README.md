@@ -177,21 +177,21 @@ Settings stores this user’s `fnn` RPC, P2P address, and the Twine daemon URL. 
 
 | Screen | Actions |
 | --- | --- |
-| Market | BUY CKB is other people’s ads. SELL CKB is yours (badge **YOUR OFFER**). Tap + to post. Tap someone else’s offer to take |
+| Market | BUY CKB is other people’s ads. SELL CKB is yours (badge **YOUR OFFER**). Tap + to post. Tap someone else’s offer to take. A seller with a new take sees **New order — accept** even while the ad is hidden |
 | Post ad | Available (CKB), currency, price (that currency per CKB, shown as `50 NGN/CKB`), min–max per take, payment rail and handle |
-| Trade | Lister: Lock, Payment received. Taker: upload receipt, Transferred notify seller, Retry. Either side: chat on an open trade, File dispute |
+| Order | Accept / Pay / Release. Lister: Accept order (Fiber lock), Reject, Release CKB. Taker: pay card, upload receipt, I have paid, Retry. Either side: cancel while the hold is Open, chat, File dispute |
 | Settings | Channel status. Open channel to Twine. Ask Twine for a return channel. Operator tools toggle |
 
 **Path A (two phones).**
 
 1. On User A, open **SELL CKB** → **+**. Post an offer, e.g. available 2 CKB, currency `NGN`, price `2000` (2000 NGN/CKB), min `2000`, max `4000`, payment `Opay`.
 2. On User A, BUY CKB stays empty (that ad is theirs). On **SELL CKB** it shows **YOUR OFFER**.
-3. On User B, **BUY CKB** shows the same card without YOUR OFFER. Tap it, pay an amount inside the limit (e.g. `2000` NGN → 1 CKB hold), **Start trade**.
-4. On User A, **My trades** → the trade → **Lock** (`send_payment` on A’s `fnn`).
-5. On User B, pay fiat outside the app, **Upload receipt**, then **Transferred, notify seller** (B’s `fnn` creates the payout invoice). The receipt is a JPEG or PNG stored on the daemon.
-6. On User A, open the trade, check the screenshot, then **Payment received**. The daemon pays B, then `settle_invoice`. State `Settled`, invoice `Paid`. Leftover 1 CKB stays listed if it still meets the minimum. No operator toggle and no award on this path.
+3. On User B, **BUY CKB** shows the same card without YOUR OFFER. Tap it, pay an amount inside the limit (e.g. `2000` NGN → 1 CKB hold), **Start trade**. B lands on the order room: waiting for the seller, with **Cancel order** while the hold is still `Open`.
+4. On User A, the book shows **New order — accept** (or **SELL CKB** links to the hidden offer). **Accept order** runs `send_payment` on A’s `fnn`, then `POST /locked`. The buyer then has 15 minutes to pay.
+5. On User B, pay fiat outside the app using the copyable handle, **Upload receipt**, then **I have paid** (B’s `fnn` creates the payout invoice). The receipt is a JPEG or PNG stored on the daemon.
+6. On User A, open the order, check the screenshot, then **Release CKB**. The daemon pays B, then `settle_invoice`. State `Settled`, invoice `Paid`. Leftover 1 CKB stays listed if it still meets the minimum. No operator toggle and no award on this path.
 
-**Path B.** After the buyer notifies the seller, disconnect the buyer on the Fiber graph so Twine cannot route, then **Payment received**. State becomes `Leg2Failed`. The hold stays `Received`. The log has no `settle_invoice`. Reconnect the buyer and press Retry with new invoice. That retry is path A.
+**Path B.** After the buyer notifies the seller, disconnect the buyer on the Fiber graph so Twine cannot route, then **Release CKB**. State becomes `Leg2Failed`. The hold stays `Received`. The log has no `settle_invoice`. Reconnect the buyer and press Retry with new invoice. That retry is path A.
 
 ```bash
 BUYER_PUB=$(curl -s http://127.0.0.1:8247 -H 'content-type: application/json' \
@@ -236,11 +236,12 @@ The daemon is the only process that talks to the Twine `fnn`. User nodes are cal
 | `POST` | `/ads/:id/cancel` | |
 | `GET` | `/trades?pubkey=` | trades for that node |
 | `POST` | `/trades` | `{"ad_id","taker","pay_amount"}`. Creates the hold |
-| `GET` | `/trades/:id` | current trade. Never includes `S`. Proof is `{content_type, bytes}` only |
+| `GET` | `/trades/:id` | current trade. Never includes `S`. Proof is `{content_type, bytes}` only. Includes `accept_by` and `pay_by` |
 | `GET` | `/trades/:id/proof` | JPEG or PNG bytes |
 | `POST` | `/trades/:id/demo_cancel` | throwaway unpaid invoice, then `cancel_invoice` |
-| `POST` | `/trades/:id/locked` | poll Twine until the hold is `Received`, then start the fiat window |
+| `POST` | `/trades/:id/locked` | poll Twine until the hold is `Received`, then start the 15-minute pay window |
 | `POST` | `/trades/:id/try_cancel` | refuses to cancel a `Received` hold |
+| `POST` | `/trades/:id/cancel` | `{"from":"lister"|"taker"}`. `WaitingHold` + `Open` runs `cancel_invoice`. Taker in `WaitingFiat` closes the pay window; hold stays `Received` |
 | `POST` | `/trades/:id/fiat_sent` | `{"invoice","proof_b64","content_type"}` JPEG/PNG, 1.5 MB max |
 | `POST` | `/trades/:id/release` | path A, or `Leg2Failed` if the buyer payment fails |
 | `POST` | `/trades/:id/retry` | `{"invoice":"…"}` path A again, from `Leg2Failed` |

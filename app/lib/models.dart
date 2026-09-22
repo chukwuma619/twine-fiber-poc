@@ -117,6 +117,8 @@ class TradeSnapshot {
     this.proof,
     this.disputeFrom,
     this.disputeReason,
+    this.acceptBy,
+    this.payBy,
   });
 
   final String id;
@@ -138,19 +140,30 @@ class TradeSnapshot {
   final ProofMeta? proof;
   final String? disputeFrom;
   final String? disputeReason;
+  final String? acceptBy;
+  final String? payBy;
 
   bool get isWaitingHold => state == 'WaitingHold';
   bool get isWaitingFiat => state == 'WaitingFiat';
+  bool get isPayWindowClosed => state == 'PayWindowClosed';
   bool get isFiatSent => state == 'FiatSent';
   bool get isReleasing => state == 'Releasing';
   bool get isLeg2Failed => state == 'Leg2Failed';
   bool get isDisputed => state == 'Disputed';
   bool get isSettled => state == 'Settled';
+  bool get isCancelled => state == 'Cancelled';
   bool get isExpired => state == 'Expired';
 
-  bool get canOpenDispute => isWaitingFiat || isFiatSent || isLeg2Failed;
+  bool get canOpenDispute =>
+      isWaitingFiat || isPayWindowClosed || isFiatSent || isLeg2Failed;
 
-  bool get canChat => isWaitingFiat || isFiatSent || isLeg2Failed || isDisputed;
+  bool get canChat =>
+      isWaitingHold ||
+      isWaitingFiat ||
+      isPayWindowClosed ||
+      isFiatSent ||
+      isLeg2Failed ||
+      isDisputed;
 
   bool get hasProof => proof != null;
 
@@ -165,6 +178,7 @@ class TradeSnapshot {
       case 'WaitingHold':
       case 'Held':
       case 'WaitingFiat':
+      case 'PayWindowClosed':
       case 'FiatSent':
       case 'Leg2Failed':
       case 'Disputed':
@@ -173,6 +187,40 @@ class TradeSnapshot {
       default:
         return false;
     }
+  }
+
+  bool get isOpen =>
+      !isSettled && !isCancelled && !isExpired && state != 'Idle' && state != 'Paid';
+
+  String statusFor(String? pubkey) {
+    if (isSettled) {
+      return 'Completed';
+    }
+    if (isCancelled) {
+      return 'Cancelled';
+    }
+    if (isExpired) {
+      return 'Expired';
+    }
+    if (isPayWindowClosed) {
+      return 'Payment window closed';
+    }
+    if (isWaitingHold) {
+      return isLister(pubkey) ? 'Accept order' : 'Waiting for seller';
+    }
+    if (isWaitingFiat) {
+      return isTaker(pubkey) ? 'Pay the seller' : 'Buyer is paying';
+    }
+    if (isFiatSent || isReleasing) {
+      return isLister(pubkey) ? 'Release CKB' : 'Waiting for release';
+    }
+    if (isLeg2Failed) {
+      return 'Payout failed';
+    }
+    if (isDisputed) {
+      return 'Under appeal';
+    }
+    return state;
   }
 
   bool isLister(String? other) => samePubkey(pubkey, other);
@@ -202,6 +250,8 @@ class TradeSnapshot {
           : null,
       disputeFrom: json['dispute_from'] as String?,
       disputeReason: json['dispute_reason'] as String?,
+      acceptBy: json['accept_by'] as String?,
+      payBy: json['pay_by'] as String?,
     );
   }
 }

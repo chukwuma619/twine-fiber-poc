@@ -64,6 +64,8 @@ Map<String, dynamic> tradeJson({
     'proof': proof,
     'dispute_from': disputeFrom,
     'dispute_reason': disputeReason,
+    'accept_by': '2999-01-01T00:00:00Z',
+    'pay_by': '2999-01-01T00:00:00Z',
     'log': [
       {'at': 't', 'text': 'hold invoice created H=0xhold1 S sealed in daemon'},
     ],
@@ -157,7 +159,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: TradeScreen(
-            key: ValueKey(pubkey),
+            key: ValueKey('$pubkey-$state'),
             settings: settings,
             daemon: widgetDaemon(client),
             fiber: widgetFiber(client),
@@ -172,13 +174,21 @@ void main() {
     await openAs(lister);
     expect(find.text('WaitingHold'), findsOneWidget);
     expect(find.byKey(const Key('lock')), findsOneWidget);
+    expect(find.text('Accept order'), findsOneWidget);
+    expect(find.byKey(const Key('reject-order')), findsOneWidget);
     expect(find.byKey(const Key('fiat-sent')), findsNothing);
+
+    await openAs(taker);
+    expect(find.byKey(const Key('lock')), findsNothing);
+    expect(find.byKey(const Key('cancel-order')), findsOneWidget);
+    expect(find.textContaining('Waiting for the seller'), findsOneWidget);
 
     state = 'WaitingFiat';
     await openAs(taker);
     expect(find.text('WaitingFiat'), findsOneWidget);
     expect(find.byKey(const Key('lock')), findsNothing);
     expect(find.byKey(const Key('fiat-sent')), findsOneWidget);
+    expect(find.text('I have paid'), findsOneWidget);
     expect(
       tester.widget<FilledButton>(find.byKey(const Key('fiat-sent'))).onPressed,
       isNull,
@@ -323,7 +333,7 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 50));
 
-    expect(find.text('Payment received'), findsOneWidget);
+    expect(find.text('Release CKB'), findsOneWidget);
     expect(find.byKey(const Key('release')), findsOneWidget);
     expect(find.byKey(const Key('fiat-sent')), findsNothing);
     expect(find.byKey(const Key('award-buyer')), findsNothing);
@@ -376,6 +386,55 @@ void main() {
     expect(find.byKey(const Key('award-buyer')), findsOneWidget);
     expect(find.byKey(const Key('award-seller')), findsOneWidget);
     expect(find.byKey(const Key('release')), findsNothing);
+  });
+
+  testWidgets('seller sees a new order when the ad is hidden', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(800, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final client = MockClient((request) async {
+      if (request.url.path == '/ads') {
+        return jsonOk(<Object>[]);
+      }
+      if (request.url.path == '/trades') {
+        return jsonOk([
+          tradeJson(state: 'WaitingHold', pubkey: lister, taker: taker),
+        ]);
+      }
+      if (request.url.path == '/trades/t1') {
+        return jsonOk(
+          tradeJson(state: 'WaitingHold', pubkey: lister, taker: taker),
+        );
+      }
+      return http.Response(jsonEncode({'error': request.url.path}), 404);
+    });
+
+    await tester.pumpWidget(
+      TwineApp(
+        client: client,
+        persistSettings: false,
+        settings: SettingsController(
+          persist: false,
+          initial: const UserSettings(
+            name: 'Ada',
+            daemonUrl: 'http://127.0.0.1:8080',
+            pubkey: lister,
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.byKey(const Key('new-order-banner')), findsOneWidget);
+    expect(find.text('New order — accept'), findsOneWidget);
+    expect(find.byKey(const Key('my-trades-badge')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('sell-tab')));
+    await tester.pump();
+    expect(find.textContaining('A buyer already placed an order'), findsOneWidget);
+    expect(find.byKey(const Key('open-hidden-trade')), findsOneWidget);
+    expect(find.text('Accept order'), findsWidgets);
   });
 }
 

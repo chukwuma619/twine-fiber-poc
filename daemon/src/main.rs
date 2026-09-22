@@ -20,8 +20,8 @@ use health::{
 };
 use market::{AdView, MarketStore};
 use order::{
-    BuyerInvoiceBody, ConnectBody, CreateAdBody, CreateTradeBody, FiatSentBody, OpenDisputeBody,
-    OrderError, PostChatBody, TradeView, HOLD_EXPIRY_POLL,
+    BuyerInvoiceBody, CancelTradeBody, ConnectBody, CreateAdBody, CreateTradeBody, FiatSentBody,
+    OpenDisputeBody, OrderError, PostChatBody, TradeView, HOLD_EXPIRY_POLL,
 };
 use rpc::FiberRpc;
 
@@ -72,6 +72,7 @@ async fn main() -> ExitCode {
         .route("/trades/{id}/demo_cancel", post(demo_cancel))
         .route("/trades/{id}/locked", post(mark_locked))
         .route("/trades/{id}/try_cancel", post(try_cancel))
+        .route("/trades/{id}/cancel", post(cancel_trade))
         .route("/trades/{id}/fiat_sent", post(fiat_sent))
         .route("/trades/{id}/release", post(release))
         .route("/trades/{id}/retry", post(retry))
@@ -101,6 +102,19 @@ async fn hold_expiry_poller(app: App) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        match app.market.poll_all_windows(&app.rpc, &app.config).await {
+            Ok(changed) => {
+                for view in changed {
+                    eprintln!(
+                        "window poll: trade={} state={:?} invoice={:?}",
+                        view.id, view.state, view.invoice_status
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("window poll error: {err:?}");
+            }
+        }
         match app.market.poll_all_hold_expiry(&app.rpc, &app.config).await {
             Ok(expired) => {
                 for view in expired {
@@ -206,6 +220,18 @@ async fn try_cancel(
 ) -> Result<Json<TradeView>, ApiError> {
     app.market
         .try_cancel(&id, &app.rpc, &app.config)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+async fn cancel_trade(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<CancelTradeBody>,
+) -> Result<Json<TradeView>, ApiError> {
+    app.market
+        .cancel_trade(&id, &app.rpc, &app.config, &body)
         .await
         .map(Json)
         .map_err(ApiError::from)

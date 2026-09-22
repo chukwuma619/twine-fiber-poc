@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'amounts.dart';
@@ -11,8 +11,8 @@ import 'fiber_api.dart';
 import 'models.dart';
 import 'settings.dart';
 
-const Duration _fiatWindow = Duration(minutes: 3);
 const Duration _orderPollInterval = Duration(seconds: 5);
+const Duration _clockTick = Duration(seconds: 1);
 
 class TradeScreen extends StatefulWidget {
   const TradeScreen({
@@ -43,9 +43,8 @@ class _TradeScreenState extends State<TradeScreen> {
   String? _error;
   var _loading = true;
   var _busy = false;
-  DateTime? _fiatDeadline;
-  Timer? _fiatTicker;
   Timer? _orderPoll;
+  Timer? _clock;
 
   UserSettings get _user => widget.settings.settings;
 
@@ -57,8 +56,8 @@ class _TradeScreenState extends State<TradeScreen> {
 
   @override
   void dispose() {
-    _fiatTicker?.cancel();
     _orderPoll?.cancel();
+    _clock?.cancel();
     _chat.dispose();
     _reason.dispose();
     super.dispose();
@@ -80,14 +79,8 @@ class _TradeScreenState extends State<TradeScreen> {
       setState(() {
         _trade = trade;
         _loading = false;
-        if (trade.isWaitingFiat && _fiatDeadline == null) {
-          _startFiatTimer();
-        }
-        if (!trade.isWaitingFiat) {
-          _clearFiatTimer();
-        }
       });
-      _syncOrderPoll(trade);
+      _syncPolls(trade);
       await _maybeLoadProof(trade);
     } catch (err) {
       if (!mounted) {
@@ -97,7 +90,7 @@ class _TradeScreenState extends State<TradeScreen> {
         _error = err.toString();
         _loading = false;
       });
-      _syncOrderPoll(null);
+      _syncPolls(null);
     }
   }
 
@@ -113,21 +106,13 @@ class _TradeScreenState extends State<TradeScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _trade = trade;
-        if (trade.isWaitingFiat && _fiatDeadline == null) {
-          _startFiatTimer();
-        }
-        if (!trade.isWaitingFiat) {
-          _clearFiatTimer();
-        }
-      });
-      _syncOrderPoll(trade);
+      setState(() => _trade = trade);
+      _syncPolls(trade);
       await _maybeLoadProof(trade);
     } catch (_) {}
   }
 
-  void _syncOrderPoll(TradeSnapshot? trade) {
+  void _syncPolls(TradeSnapshot? trade) {
     final shouldPoll = trade?.watchesHoldExpiry ?? false;
     if (shouldPoll) {
       _orderPoll ??= Timer.periodic(_orderPollInterval, (_) {
@@ -136,6 +121,17 @@ class _TradeScreenState extends State<TradeScreen> {
     } else {
       _orderPoll?.cancel();
       _orderPoll = null;
+    }
+    final hasDeadline = _deadlineOf(trade) != null && shouldPoll;
+    if (hasDeadline) {
+      _clock ??= Timer.periodic(_clockTick, (_) {
+        if (mounted) {
+          setState(() {});
+        }
+      });
+    } else {
+      _clock?.cancel();
+      _clock = null;
     }
   }
 
@@ -152,13 +148,8 @@ class _TradeScreenState extends State<TradeScreen> {
       setState(() {
         _trade = trade;
         _busy = false;
-        if (trade.isWaitingFiat) {
-          _startFiatTimer();
-        } else {
-          _clearFiatTimer();
-        }
       });
-      _syncOrderPoll(trade);
+      _syncPolls(trade);
       await _maybeLoadProof(trade);
     } catch (err) {
       if (!mounted) {
@@ -198,67 +189,66 @@ class _TradeScreenState extends State<TradeScreen> {
   Future<String> _buyerInvoice() async {
     final trade = _trade;
     if (trade == null) {
-      throw const DaemonException('trade not loaded');
+      throw const DaemonException('trade is not loaded');
     }
     return widget.fiber.newInvoice(
       _user.fiberRpc,
       amountHex: shannonHex(trade.amount),
-      description: 'twine path A buyer ${trade.amount} CKB',
+      description: 'twine payout ${trade.id}',
     );
   }
 
   Future<void> _chooseProof() async {
-    final picker = widget.pickProof ?? _pickFromLibrary;
-    final picked = await picker();
+    final picked = widget.pickProof != null
+        ? await widget.pickProof!()
+        : await _pickFromGallery();
     if (!mounted || picked == null) {
       return;
     }
     setState(() => _picked = picked);
   }
 
-  Future<PickedProof?> _pickFromLibrary() async {
+  Future<PickedProof?> _pickFromGallery() async {
     final file = await ImagePicker().pickImage(source: ImageSource.gallery);
     if (file == null) {
       return null;
     }
     final bytes = await file.readAsBytes();
-    if (bytes.isEmpty) {
-      return null;
+    final name = file.name.toLowerCase();
+    final contentType = name.endsWith('.png')
+        ? 'image/png'
+        : 'image/jpeg';
+    return PickedProof(bytes: bytes, contentType: contentType);
+  }
+
+  Future<void> _copy(String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) {
+      return;
     }
-    return PickedProof(
-      bytes: bytes,
-      contentType: file.mimeType ?? _mimeFromName(file.name),
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Copied')),
     );
   }
 
-  String _mimeFromName(String name) {
-    final lower = name.toLowerCase();
-    if (lower.endsWith('.png')) {
-      return 'image/png';
+  DateTime? _deadlineOf(TradeSnapshot? trade) {
+    if (trade == null) {
+      return null;
     }
-    return 'image/jpeg';
+    final raw = trade.isWaitingHold ? trade.acceptBy : trade.payBy;
+    if (raw == null || raw.isEmpty) {
+      return null;
+    }
+    return DateTime.tryParse(raw);
   }
 
-  void _startFiatTimer() {
-    _fiatDeadline ??= DateTime.now().add(_fiatWindow);
-    _fiatTicker?.cancel();
-    _fiatTicker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {});
-    });
-  }
-
-  void _clearFiatTimer() {
-    _fiatTicker?.cancel();
-    _fiatTicker = null;
-    _fiatDeadline = null;
-  }
-
-  String? get _fiatRemaining {
-    final deadline = _fiatDeadline;
-    if (deadline == null || !(_trade?.isWaitingFiat ?? false)) {
+  String? get _deadlineRemaining {
+    final trade = _trade;
+    final deadline = _deadlineOf(trade);
+    if (deadline == null) {
+      return null;
+    }
+    if (!(trade?.isWaitingHold ?? false) && !(trade?.isWaitingFiat ?? false)) {
       return null;
     }
     final left = deadline.difference(DateTime.now());
@@ -278,6 +268,62 @@ class _TradeScreenState extends State<TradeScreen> {
     return 'Watching this trade';
   }
 
+  String _nextStep(TradeSnapshot trade, bool listed, bool took) {
+    if (trade.isWaitingHold && listed) {
+      return 'Accept the order to lock CKB on Fiber. Until then the hold is Open and either of you can cancel.';
+    }
+    if (trade.isWaitingHold && took) {
+      return 'Waiting for the seller to accept. The hold invoice is still Open.';
+    }
+    if (trade.isWaitingFiat && took) {
+      return 'Pay the seller with the handle below, then upload a receipt.';
+    }
+    if (trade.isWaitingFiat && listed) {
+      return 'Buyer is paying you. CKB stays locked on Fiber until you release.';
+    }
+    if (trade.isPayWindowClosed && listed) {
+      return 'Buyer did not pay. Your CKB returns when the hold expires.';
+    }
+    if (trade.isPayWindowClosed && took) {
+      return 'Payment window closed. The hold cannot be cancelled while Received.';
+    }
+    if ((trade.isFiatSent || trade.isReleasing) && listed) {
+      return 'Check the receipt, then release. Twine pays the buyer invoice and settles the hold.';
+    }
+    if ((trade.isFiatSent || trade.isReleasing) && took) {
+      return 'Waiting for the seller to release. Twine will pay your invoice, then settle.';
+    }
+    if (trade.isLeg2Failed && took) {
+      return 'Twine could not pay your invoice. Submit a new one to retry. The hold stays Received.';
+    }
+    if (trade.isLeg2Failed && listed) {
+      return 'Payment to the buyer failed. The hold stays Received until they retry or the TLC expires.';
+    }
+    if (trade.isDisputed) {
+      return 'Appeal is open. Twine awards only after this filing.';
+    }
+    if (trade.isSettled) {
+      return 'Completed. Twine paid the buyer and settled the hold.';
+    }
+    if (trade.isCancelled) {
+      return 'Cancelled while the hold was Open. Reserved CKB is back on the ad.';
+    }
+    if (trade.isExpired) {
+      return 'Hold expired. Seller refunded because the TLC expired.';
+    }
+    return trade.statusFor(_user.pubkey);
+  }
+
+  int _stepIndex(TradeSnapshot? trade) {
+    if (trade == null || trade.isWaitingHold || trade.isCancelled) {
+      return 0;
+    }
+    if (trade.isWaitingFiat || trade.isPayWindowClosed) {
+      return 1;
+    }
+    return 2;
+  }
+
   @override
   Widget build(BuildContext context) {
     final trade = _trade;
@@ -290,15 +336,37 @@ class _TradeScreenState extends State<TradeScreen> {
         (took || listed) && (trade?.canOpenDispute ?? false) && !_busy;
     final appealReady = canAppeal && _reason.text.trim().isNotEmpty;
     final stateLabel = _loading ? 'Loading' : (trade?.state ?? 'Idle');
+    final colors = Theme.of(context).colorScheme;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Trade')),
+      appBar: AppBar(title: const Text('Order')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          _StepHeader(current: _stepIndex(trade)),
+          const SizedBox(height: 16),
           if (trade != null) Text(_sideLabel(trade)),
-          const SizedBox(height: 8),
-          if (listed && (trade?.isWaitingHold ?? false))
+          if (trade != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _nextStep(trade, listed, took),
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: colors.onSurfaceVariant,
+              ),
+            ),
+          ],
+          if (_deadlineRemaining != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(
+                trade?.isWaitingHold ?? false
+                    ? 'Accept window: $_deadlineRemaining'
+                    : 'Fiat window: $_deadlineRemaining',
+                key: const Key('fiat-timer'),
+              ),
+            ),
+          const SizedBox(height: 16),
+          if (listed && (trade?.isWaitingHold ?? false)) ...[
             FilledButton(
               key: const Key('lock'),
               onPressed: _busy
@@ -314,8 +382,44 @@ class _TradeScreenState extends State<TradeScreen> {
                         widget.tradeId,
                       );
                     }),
-              child: const Text('Lock'),
+              child: const Text('Accept order'),
             ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              key: const Key('reject-order'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(
+                      () => widget.daemon.cancelTrade(
+                        _user.daemonUrl,
+                        widget.tradeId,
+                        from: 'lister',
+                      ),
+                    ),
+              child: const Text('Reject'),
+            ),
+          ],
+          if (took && (trade?.isWaitingHold ?? false))
+            OutlinedButton(
+              key: const Key('cancel-order'),
+              onPressed: _busy
+                  ? null
+                  : () => _run(
+                      () => widget.daemon.cancelTrade(
+                        _user.daemonUrl,
+                        widget.tradeId,
+                        from: 'taker',
+                      ),
+                    ),
+              child: const Text('Cancel order'),
+            ),
+          if (trade != null) ...[
+            const SizedBox(height: 16),
+            _PayCard(
+              trade: trade,
+              onCopy: () => _copy(trade.paymentMethod),
+            ),
+          ],
           if (took && (trade?.isWaitingFiat ?? false)) ...[
             const SizedBox(height: 8),
             OutlinedButton(
@@ -341,7 +445,7 @@ class _TradeScreenState extends State<TradeScreen> {
                         contentType: picked.contentType,
                       );
                     }),
-              child: const Text('Transferred, notify seller'),
+              child: const Text('I have paid'),
             ),
           ],
           if (_proofBytes != null) ...[
@@ -371,7 +475,7 @@ class _TradeScreenState extends State<TradeScreen> {
               child: Text(
                 (trade?.isReleasing ?? false)
                     ? 'Payment received (continue path A)'
-                    : 'Payment received',
+                    : 'Release CKB',
               ),
             ),
           ],
@@ -543,11 +647,6 @@ class _TradeScreenState extends State<TradeScreen> {
                 key: const Key('invoice-address'),
               ),
           ],
-          if (_fiatRemaining != null)
-            Text(
-              'Fiat window: $_fiatRemaining',
-              key: const Key('fiat-timer'),
-            ),
           if (_error != null) ...[
             const SizedBox(height: 8),
             Text(_error!, key: const Key('error-message')),
@@ -567,6 +666,100 @@ class _TradeScreenState extends State<TradeScreen> {
                 ),
               ),
         ],
+      ),
+    );
+  }
+}
+
+class _StepHeader extends StatelessWidget {
+  const _StepHeader({required this.current});
+
+  final int current;
+
+  static const labels = ['Accept', 'Pay', 'Release'];
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Row(
+      children: [
+        for (var index = 0; index < labels.length; index++) ...[
+          if (index > 0)
+            Expanded(
+              child: Container(
+                height: 1,
+                color: index <= current ? colors.primary : colors.outlineVariant,
+              ),
+            ),
+          Column(
+            children: [
+              CircleAvatar(
+                radius: 12,
+                backgroundColor: index <= current
+                    ? colors.primary
+                    : colors.surfaceContainerHighest,
+                foregroundColor: index <= current
+                    ? colors.onPrimary
+                    : colors.onSurfaceVariant,
+                child: Text('${index + 1}', style: const TextStyle(fontSize: 12)),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                labels[index],
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: index <= current ? colors.onSurface : colors.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _PayCard extends StatelessWidget {
+  const _PayCard({required this.trade, required this.onCopy});
+
+  final TradeSnapshot trade;
+  final VoidCallback onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      key: const Key('pay-card'),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${trade.payAmount} ${trade.currency}',
+              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text('${trade.amount} CKB · ${trade.price} ${trade.currency}/CKB'),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    trade.paymentMethod,
+                    key: const Key('payment-handle'),
+                  ),
+                ),
+                IconButton(
+                  key: const Key('copy-payment'),
+                  onPressed: onCopy,
+                  icon: const Icon(Icons.copy),
+                  tooltip: 'Copy payment handle',
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }

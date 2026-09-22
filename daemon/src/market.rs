@@ -8,14 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::health::Config;
 use crate::order::{
-    add_ckb, allows_chat, attempt_settle_after_expiry, cancel_hold_invoice, ckb_from_fiat,
-    cmp_ckb, create_hold_invoice, decode_payment_proof, demo_cancel_invoice,
-    fetch_invoice_status, fiat_from_ckb, new_id, normalize_amount, normalize_pubkey,
-    party_from, payment_hash_of, poll_invoice_paid, poll_invoice_received, poll_payment_done,
-    require_received_for_award, require_received_for_dispute, send_payment_to_invoice,
-    settle_hold, timestamp, BuyerInvoiceBody, CreateAdBody, CreateTradeBody, FiatSentBody,
+    add_ckb, allows_chat, allows_dispute, attempt_settle_after_expiry, cancel_hold_invoice,
+    ckb_from_fiat, cmp_ckb, create_hold_invoice, deadline_from_now, deadline_passed,
+    decode_payment_proof, demo_cancel_invoice, fetch_invoice_status, fiat_from_ckb, new_id,
+    normalize_amount, normalize_pubkey, party_from, payment_hash_of, poll_invoice_paid,
+    poll_invoice_received, poll_payment_done, require_received_for_award,
+    require_received_for_dispute, send_payment_to_invoice, settle_hold, timestamp,
+    BuyerInvoiceBody, CancelTradeBody, CreateAdBody, CreateTradeBody, FiatSentBody,
     OpenDisputeBody, OrderError, OrderState, PayFailureMode, PostChatBody, ProofMeta, Trade,
-    TradeView, FINAL_EXPIRY_DELTA_MS,
+    TradeView, ACCEPT_WINDOW, FINAL_EXPIRY_DELTA_MS, PAY_WINDOW,
 };
 use crate::rpc::FiberRpc;
 
@@ -336,6 +337,8 @@ impl MarketStore {
                 dispute_reason: None,
                 log: vec![],
                 chat: vec![],
+                accept_by: None,
+                pay_by: None,
             };
             {
                 let listed = market.ads.get_mut(&body.ad_id).expect("ad exists");
@@ -372,6 +375,7 @@ impl MarketStore {
         trade.payment_preimage = Some(preimage);
         trade.invoice_address = Some(address.clone());
         trade.invoice_status = Some(status.clone());
+        trade.accept_by = Some(deadline_from_now(ACCEPT_WINDOW));
         trade.push_log(format!(
             "created trade for {amount} CKB ({pay_amount} {currency} at {price} {currency}/CKB); listed by {listed_by}"
         ));
@@ -457,13 +461,17 @@ impl MarketStore {
         }
         trade.state = OrderState::WaitingFiat;
         trade.invoice_status = Some(status.clone());
+        trade.pay_by = Some(deadline_from_now(PAY_WINDOW));
         trade.push_log(format!(
             "seller locked: send_payment submitted, get_invoice={status}"
         ));
         trade.push_log(format!(
             "H={payment_hash} S still sealed in daemon; Twine spendable balance unchanged until settle"
         ));
-        trade.push_log("buyer accepted; start fiat timer in the app");
+        trade.push_log(format!(
+            "seller accepted; pay window until {}",
+            trade.pay_by.as_deref().unwrap_or("unset")
+        ));
         let view = trade.view();
         save(&self.path, &market).map_err(OrderError::Save)?;
         eprintln!("locked H={payment_hash} invoice={status} state=WaitingFiat");
@@ -548,6 +556,75 @@ impl MarketStore {
         }
     }
 
+    pub async fn cancel_trade(
+        &self,
+        id: &str,
+        rpc: &FiberRpc,
+        config: &Config,
+        body: &CancelTradeBody,
+    ) -> Result<TradeView, OrderError> {
+        let from = party_from(&body.from)?;
+        let (state, payment_hash) = {
+            let market = self.guard();
+            let trade = market
+                .trades
+                .get(id)
+                .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
+            (trade.state, trade.payment_hash.clone())
+        };
+        match state {
+            OrderState::WaitingHold => {
+                let payment_hash = payment_hash
+                    .ok_or_else(|| OrderError::BadState("no hold invoice yet".into()))?;
+                let status = fetch_invoice_status(rpc, &config.twine_rpc, &payment_hash).await?;
+                if status != "Open" {
+                    return Err(OrderError::BadState(format!(
+                        "hold is already {status}; cancel_invoice is not legal after Received"
+                    )));
+                }
+                let view = self.try_cancel(id, rpc, config).await?;
+                if view.state != OrderState::Cancelled {
+                    return Err(OrderError::BadState(format!(
+                        "hold cannot be cancelled while {}",
+                        view.invoice_status.as_deref().unwrap_or(status.as_str())
+                    )));
+                }
+                let mut market = self.guard();
+                let trade = market
+                    .trades
+                    .get_mut(id)
+                    .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
+                trade.push_log(format!("{from} cancelled while the hold invoice was Open"));
+                let view = trade.view();
+                save(&self.path, &market).map_err(OrderError::Save)?;
+                Ok(view)
+            }
+            OrderState::WaitingFiat if from == "taker" => {
+                let mut market = self.guard();
+                let trade = market
+                    .trades
+                    .get_mut(id)
+                    .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
+                if trade.state != OrderState::WaitingFiat {
+                    return Err(OrderError::BadState(format!(
+                        "trade changed while cancelling, got {:?}",
+                        trade.state
+                    )));
+                }
+                close_pay_window(trade);
+                trade.push_log(
+                    "taker cancelled during pay window; hold cannot be cancelled while Received",
+                );
+                let view = trade.view();
+                save(&self.path, &market).map_err(OrderError::Save)?;
+                Ok(view)
+            }
+            other => Err(OrderError::BadState(format!(
+                "cancel needs WaitingHold, or taker cancel in WaitingFiat, got {other:?}"
+            ))),
+        }
+    }
+
     pub fn fiat_sent(&self, id: &str, body: &FiatSentBody) -> Result<TradeView, OrderError> {
         let invoice = require_text(&body.invoice, "invoice")?;
         let (content_type, data) = decode_payment_proof(&body.proof_b64, &body.content_type)?;
@@ -557,11 +634,19 @@ impl MarketStore {
                 .trades
                 .get(id)
                 .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
+            if trade.state == OrderState::PayWindowClosed {
+                return Err(OrderError::BadState(
+                    "fiat sent needs WaitingFiat, got PayWindowClosed".into(),
+                ));
+            }
             if trade.state != OrderState::WaitingFiat {
                 return Err(OrderError::BadState(format!(
                     "fiat sent needs WaitingFiat, got {:?}",
                     trade.state
                 )));
+            }
+            if deadline_passed(trade.pay_by.as_deref()) {
+                return Err(OrderError::BadState("payment window closed".into()));
             }
         }
         self.write_proof(id, &data)?;
@@ -575,6 +660,11 @@ impl MarketStore {
                 "trade changed while storing proof, got {:?}",
                 trade.state
             )));
+        }
+        if deadline_passed(trade.pay_by.as_deref()) {
+            close_pay_window(trade);
+            save(&self.path, &market).map_err(OrderError::Save)?;
+            return Err(OrderError::BadState("payment window closed".into()));
         }
         trade.buyer_invoice = Some(invoice);
         trade.proof = Some(ProofMeta {
@@ -691,13 +781,10 @@ impl MarketStore {
                 .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
             (trade.state, trade.payment_hash.clone())
         };
-        match state {
-            OrderState::WaitingFiat | OrderState::FiatSent | OrderState::Leg2Failed => {}
-            other => {
-                return Err(OrderError::BadState(format!(
-                    "open dispute needs WaitingFiat, FiatSent, or Leg2Failed, got {other:?}"
-                )));
-            }
+        if !allows_dispute(state) {
+            return Err(OrderError::BadState(format!(
+                "open dispute needs WaitingFiat, FiatSent, Leg2Failed, or PayWindowClosed, got {state:?}"
+            )));
         }
         let payment_hash =
             payment_hash.ok_or_else(|| OrderError::BadState("missing hold payment hash".into()))?;
@@ -709,13 +796,11 @@ impl MarketStore {
             .trades
             .get_mut(id)
             .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
-        match trade.state {
-            OrderState::WaitingFiat | OrderState::FiatSent | OrderState::Leg2Failed => {}
-            other => {
-                return Err(OrderError::BadState(format!(
-                    "trade changed while opening dispute, got {other:?}"
-                )));
-            }
+        if !allows_dispute(trade.state) {
+            return Err(OrderError::BadState(format!(
+                "trade changed while opening dispute, got {:?}",
+                trade.state
+            )));
         }
         trade.state = OrderState::Disputed;
         trade.dispute_from = Some(from.clone());
@@ -852,6 +937,107 @@ impl MarketStore {
             "path C award seller H={payment_hash} invoice={status} (no settle, no cancel)"
         );
         Ok(view)
+    }
+
+    pub async fn poll_all_windows(
+        &self,
+        rpc: &FiberRpc,
+        config: &Config,
+    ) -> Result<Vec<TradeView>, OrderError> {
+        let snapshot: Vec<(String, OrderState)> = {
+            let market = self.guard();
+            market
+                .trades
+                .values()
+                .filter(|trade| {
+                    matches!(
+                        trade.state,
+                        OrderState::WaitingHold | OrderState::WaitingFiat
+                    )
+                })
+                .map(|trade| (trade.id.clone(), trade.state))
+                .collect()
+        };
+        let mut changed = Vec::new();
+        for (id, state) in snapshot {
+            match state {
+                OrderState::WaitingHold => {
+                    if let Some(view) = self.expire_accept_if_due(&id, rpc, config).await? {
+                        changed.push(view);
+                    }
+                }
+                OrderState::WaitingFiat => {
+                    if let Some(view) = self.expire_pay_if_due(&id)? {
+                        changed.push(view);
+                    }
+                }
+                other => {
+                    let _ = other;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn expire_accept_if_due(
+        &self,
+        id: &str,
+        rpc: &FiberRpc,
+        config: &Config,
+    ) -> Result<Option<TradeView>, OrderError> {
+        let due = {
+            let market = self.guard();
+            let Some(trade) = market.trades.get(id) else {
+                return Ok(None);
+            };
+            trade.state == OrderState::WaitingHold && deadline_passed(trade.accept_by.as_deref())
+        };
+        if !due {
+            return Ok(None);
+        }
+        let view = self.try_cancel(id, rpc, config).await?;
+        if view.state == OrderState::Cancelled {
+            let mut market = self.guard();
+            if let Some(trade) = market.trades.get_mut(id) {
+                trade.push_log("accept window closed");
+                let view = trade.view();
+                save(&self.path, &market).map_err(OrderError::Save)?;
+                return Ok(Some(view));
+            }
+        }
+        Ok(Some(view))
+    }
+
+    fn expire_pay_if_due(&self, id: &str) -> Result<Option<TradeView>, OrderError> {
+        let mut market = self.guard();
+        let Some(trade) = market.trades.get_mut(id) else {
+            return Ok(None);
+        };
+        if trade.state != OrderState::WaitingFiat || !deadline_passed(trade.pay_by.as_deref()) {
+            return Ok(None);
+        }
+        close_pay_window(trade);
+        let view = trade.view();
+        save(&self.path, &market).map_err(OrderError::Save)?;
+        Ok(Some(view))
+    }
+
+    #[cfg(test)]
+    pub fn set_accept_by(&self, id: &str, when: &str) {
+        let mut market = self.guard();
+        if let Some(trade) = market.trades.get_mut(id) {
+            trade.accept_by = Some(when.to_string());
+            let _ = save(&self.path, &market);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_pay_by(&self, id: &str, when: &str) {
+        let mut market = self.guard();
+        if let Some(trade) = market.trades.get_mut(id) {
+            trade.pay_by = Some(when.to_string());
+            let _ = save(&self.path, &market);
+        }
     }
 
     pub async fn poll_all_hold_expiry(
@@ -1236,6 +1422,13 @@ fn subtract_ckb(left: &str, right: &str) -> Result<String, String> {
 
 fn parse_available(raw: &str) -> Result<u128, String> {
     crate::order::parse_decimal_8(raw)
+}
+
+fn close_pay_window(trade: &mut Trade) {
+    trade.state = OrderState::PayWindowClosed;
+    trade.push_log(
+        "pay window closed; hold stays Received; seller refund at TLC expiry; cancel_invoice not called",
+    );
 }
 
 fn require_text(raw: &str, field: &str) -> Result<String, OrderError> {

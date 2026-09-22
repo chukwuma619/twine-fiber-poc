@@ -23,6 +23,12 @@ pub const FINAL_EXPIRY_DELTA_MS: u64 = 57_600_000;
 /// How often the daemon polls Twine `get_invoice` for Path D expiry.
 pub const HOLD_EXPIRY_POLL: Duration = Duration::from_secs(15);
 
+/// Seller must accept (lock the hold) within this window while the invoice is Open.
+pub const ACCEPT_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// Buyer must mark fiat sent within this window after the hold is Received.
+pub const PAY_WINDOW: Duration = Duration::from_secs(15 * 60);
+
 /// Persisted trade. `payment_preimage` stays on disk / in the daemon only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trade {
@@ -60,6 +66,10 @@ pub struct Trade {
     pub log: Vec<LogLine>,
     #[serde(default)]
     pub chat: Vec<ChatLine>,
+    #[serde(default)]
+    pub accept_by: Option<String>,
+    #[serde(default)]
+    pub pay_by: Option<String>,
 }
 
 /// Public trade view. Never includes `payment_preimage`.
@@ -84,6 +94,8 @@ pub struct TradeView {
     pub dispute_reason: Option<String>,
     pub log: Vec<LogLine>,
     pub chat: Vec<ChatLine>,
+    pub accept_by: Option<String>,
+    pub pay_by: Option<String>,
 }
 
 impl Trade {
@@ -94,6 +106,7 @@ impl Trade {
             OrderState::Held
                 | OrderState::WaitingHold
                 | OrderState::WaitingFiat
+                | OrderState::PayWindowClosed
                 | OrderState::FiatSent
                 | OrderState::Leg2Failed
                 | OrderState::Disputed
@@ -122,6 +135,8 @@ impl Trade {
             dispute_reason: self.dispute_reason.clone(),
             log: self.log.clone(),
             chat: self.chat.clone(),
+            accept_by: self.accept_by.clone(),
+            pay_by: self.pay_by.clone(),
         }
     }
 
@@ -152,6 +167,7 @@ pub enum OrderState {
     WaitingHold,
     Held,
     WaitingFiat,
+    PayWindowClosed,
     FiatSent,
     Releasing,
     Leg2Failed,
@@ -192,6 +208,11 @@ pub struct FiatSentBody {
 pub struct OpenDisputeBody {
     pub from: String,
     pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelTradeBody {
+    pub from: String,
 }
 
 /// JPEG or PNG, 1.5 MB max.
@@ -257,11 +278,38 @@ pub fn party_from(raw: &str) -> Result<String, OrderError> {
 pub fn allows_chat(state: OrderState) -> bool {
     matches!(
         state,
-        OrderState::WaitingFiat
+        OrderState::WaitingHold
+            | OrderState::WaitingFiat
+            | OrderState::PayWindowClosed
             | OrderState::FiatSent
             | OrderState::Leg2Failed
             | OrderState::Disputed
     )
+}
+
+pub fn allows_dispute(state: OrderState) -> bool {
+    matches!(
+        state,
+        OrderState::WaitingFiat
+            | OrderState::PayWindowClosed
+            | OrderState::FiatSent
+            | OrderState::Leg2Failed
+    )
+}
+
+pub fn deadline_from_now(window: Duration) -> String {
+    let extra = chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::seconds(0));
+    (chrono::Utc::now() + extra).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub fn deadline_passed(raw: Option<&str>) -> bool {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(when) => chrono::Utc::now() >= when.with_timezone(&chrono::Utc),
+        Err(_) => false,
+    }
 }
 
 /// How Path A payment failure updates trade state.
@@ -860,6 +908,14 @@ mod tests {
         assert!(decode_payment_proof("", "image/jpeg").is_err());
         assert!(decode_payment_proof(&jpeg_b64, "image/png").is_err());
         assert!(decode_payment_proof("@@@", "image/jpeg").is_err());
+    }
+
+    #[test]
+    fn deadline_passed_reads_rfc3339() {
+        assert!(!deadline_passed(None));
+        assert!(!deadline_passed(Some("")));
+        assert!(deadline_passed(Some("2000-01-01T00:00:00Z")));
+        assert!(!deadline_passed(Some("2999-01-01T00:00:00Z")));
     }
 }
 

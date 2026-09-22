@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'daemon_api.dart';
@@ -37,18 +39,43 @@ class _HomeShellState extends State<HomeShell> {
   var _loading = true;
   var _side = BookSide.buy;
   var _tab = HomeTab.book;
+  Timer? _poll;
 
   UserSettings get _user => widget.settings.settings;
+
+  List<TradeSnapshot> get _incomingOrders => [
+    for (final trade in _trades)
+      if (trade.isLister(_user.pubkey) && trade.isWaitingHold) trade,
+  ];
+
+  List<TradeSnapshot> get _openListedTrades => [
+    for (final trade in _trades)
+      if (trade.isLister(_user.pubkey) && trade.isOpen) trade,
+  ];
+
+  int get _actionCount => _trades.where((trade) {
+    if (trade.isLister(_user.pubkey)) {
+      return trade.isWaitingHold || trade.isFiatSent || trade.isReleasing;
+    }
+    if (trade.isTaker(_user.pubkey)) {
+      return trade.isWaitingFiat || trade.isLeg2Failed;
+    }
+    return false;
+  }).length;
 
   @override
   void initState() {
     super.initState();
     widget.settings.addListener(_onSettings);
     _load();
+    _poll = Timer.periodic(const Duration(seconds: 5), (_) {
+      _fetch(showSpinner: false);
+    });
   }
 
   @override
   void dispose() {
+    _poll?.cancel();
     widget.settings.removeListener(_onSettings);
     super.dispose();
   }
@@ -59,11 +86,15 @@ class _HomeShellState extends State<HomeShell> {
     }
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  Future<void> _load() => _fetch(showSpinner: true);
+
+  Future<void> _fetch({required bool showSpinner}) async {
+    if (showSpinner) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final ads = await widget.daemon.listAds(_user.daemonUrl);
       final trades = await widget.daemon.listTrades(
@@ -233,15 +264,23 @@ class _HomeShellState extends State<HomeShell> {
             _tab = index == 0 ? HomeTab.book : HomeTab.trades;
           });
         },
-        destinations: const [
-          NavigationDestination(
+        destinations: [
+          const NavigationDestination(
             icon: Icon(Icons.menu_book_outlined),
             selectedIcon: Icon(Icons.menu_book),
             label: 'Order book',
           ),
           NavigationDestination(
-            icon: Icon(Icons.swap_horiz_outlined),
-            selectedIcon: Icon(Icons.swap_horiz),
+            icon: Badge(
+              isLabelVisible: _actionCount > 0,
+              label: Text('$_actionCount', key: const Key('my-trades-badge')),
+              child: const Icon(Icons.swap_horiz_outlined),
+            ),
+            selectedIcon: Badge(
+              isLabelVisible: _actionCount > 0,
+              label: Text('$_actionCount'),
+              child: const Icon(Icons.swap_horiz),
+            ),
             label: 'My trades',
           ),
         ],
@@ -251,29 +290,60 @@ class _HomeShellState extends State<HomeShell> {
 
   Widget _bookBody() {
     final ads = _visibleAds;
-    if (_loading && _ads.isEmpty) {
+    final incoming = _incomingOrders;
+    if (_loading && _ads.isEmpty && _trades.isEmpty) {
       return const Center(child: Text('Loading'));
     }
     if (ads.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text(
-            _side == BookSide.buy
-                ? 'No one is selling CKB yet.'
-                : 'You have no sell offers. Tap + to post one.',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
-          ),
-        ),
+      final hidden = _side == BookSide.sell && _openListedTrades.isNotEmpty
+          ? _openListedTrades.first
+          : null;
+      return ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
+        children: [
+          if (incoming.isNotEmpty) ...[
+            _incomingBanner(incoming.first),
+            const SizedBox(height: 16),
+          ],
+          if (hidden != null) ...[
+            Text(
+              'A buyer already placed an order on your offer.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              key: const Key('open-hidden-trade'),
+              onPressed: () => _openTrade(hidden.id),
+              child: Text(hidden.statusFor(_user.pubkey)),
+            ),
+          ] else
+            Padding(
+              padding: const EdgeInsets.only(top: 48),
+              child: Text(
+                _side == BookSide.buy
+                    ? 'No one is selling CKB yet.'
+                    : 'You have no sell offers. Tap + to post one.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+        ],
       );
     }
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
-      itemCount: ads.length,
+      itemCount: ads.length + (incoming.isNotEmpty ? 1 : 0),
       separatorBuilder: (_, _) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
-        final ad = ads[index];
+        if (incoming.isNotEmpty && index == 0) {
+          return _incomingBanner(incoming.first);
+        }
+        final ad = ads[incoming.isNotEmpty ? index - 1 : index];
         final mine = ad.isMine(_user.pubkey);
         return OfferCard(
           ad: ad,
@@ -281,6 +351,20 @@ class _HomeShellState extends State<HomeShell> {
           onTake: mine || _loading ? null : () => _take(ad),
         );
       },
+    );
+  }
+
+  Widget _incomingBanner(TradeSnapshot trade) {
+    return Card(
+      key: const Key('new-order-banner'),
+      child: ListTile(
+        title: const Text('New order — accept'),
+        subtitle: Text(
+          '${trade.payAmount} ${trade.currency} · ${trade.amount} CKB',
+        ),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: () => _openTrade(trade.id),
+      ),
     );
   }
 
@@ -311,7 +395,7 @@ class _HomeShellState extends State<HomeShell> {
         return Card(
           key: Key('my-trade-${trade.id}'),
           child: ListTile(
-            title: Text('${trade.amount} CKB · ${trade.state}'),
+            title: Text('${trade.amount} CKB · ${trade.statusFor(_user.pubkey)}'),
             subtitle: Text(
               '${trade.payAmount} ${trade.currency}',
             ),

@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::order::{
-    BuyerInvoiceBody, CreateAdBody, CreateTradeBody, FiatSentBody, OpenDisputeBody, OrderError,
-    OrderState, PostChatBody, TradeView, fiat_from_ckb,
+    BuyerInvoiceBody, CancelTradeBody, CreateAdBody, CreateTradeBody, FiatSentBody,
+    OpenDisputeBody, OrderError, OrderState, PostChatBody, TradeView, fiat_from_ckb,
 };
 use crate::health::Config;
 use crate::market::MarketStore;
@@ -70,6 +70,7 @@ async fn walks_hold_release_dispute_and_expiry() {
     let created = start_trade(&store, &rpc, &config).await;
     assert_eq!(created.state, OrderState::WaitingHold);
     assert_eq!(created.invoice_status.as_deref(), Some("Open"));
+    assert!(created.accept_by.is_some());
     assert!(log_contains(&created, "S sealed"));
     assert_hides_preimage(&created, &path);
     let hold_hash = created.payment_hash.clone().unwrap();
@@ -95,6 +96,7 @@ async fn walks_hold_release_dispute_and_expiry() {
     let locked = store.mark_locked(&trade_id, &rpc, &config).await.unwrap();
     assert_eq!(locked.state, OrderState::WaitingFiat);
     assert_eq!(locked.invoice_status.as_deref(), Some("Received"));
+    assert!(locked.pay_by.is_some());
     assert_eq!(fiber.lock().unwrap().status_of(&hold_hash), "Received");
     let cancels_before = fiber.lock().unwrap().cancels.len();
     let skipped = store.try_cancel(&trade_id, &rpc, &config).await.unwrap();
@@ -448,6 +450,133 @@ async fn range_take_locks_the_slice_and_hides_dust() {
         .find(|listed| listed.id == ad.id)
         .expect("cancelled slice returns CKB to the ad");
     assert_eq!(restored.available, "2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_window_cancel_returns_ckb() {
+    let path = temp_path();
+    let _remove = RemoveFile(path.clone());
+    let fiber = Arc::new(Mutex::new(FiberNode::new()));
+    let config = serve(Arc::clone(&fiber)).await;
+    let rpc = FiberRpc::new();
+    let store = MarketStore::open(path).unwrap();
+
+    let ad = post_ad(&store, "1");
+    let created = start_trade_on(&store, &rpc, &config, &ad.id)
+        .await
+        .unwrap();
+    store.set_accept_by(&created.id, "2000-01-01T00:00:00Z");
+    let changed = store.poll_all_windows(&rpc, &config).await.unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].state, OrderState::Cancelled);
+    assert!(log_contains(&changed[0], "accept window closed"));
+    assert_eq!(fiber.lock().unwrap().status_of(created.payment_hash.as_deref().unwrap()), "Cancelled");
+    let restored = store
+        .list_ads()
+        .into_iter()
+        .find(|listed| listed.id == ad.id)
+        .expect("accept timeout returns CKB");
+    assert_eq!(restored.available, "1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_cancel_while_open_then_refuses_after_received() {
+    let path = temp_path();
+    let _remove = RemoveFile(path.clone());
+    let fiber = Arc::new(Mutex::new(FiberNode::new()));
+    let config = serve(Arc::clone(&fiber)).await;
+    let rpc = FiberRpc::new();
+    let store = MarketStore::open(path).unwrap();
+
+    let first = start_trade(&store, &rpc, &config).await;
+    let cancelled = store
+        .cancel_trade(
+            &first.id,
+            &rpc,
+            &config,
+            &CancelTradeBody {
+                from: "taker".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.state, OrderState::Cancelled);
+
+    let waiting = start_trade(&store, &rpc, &config).await;
+    let hash = waiting.payment_hash.clone().unwrap();
+    mark_received(&fiber, &hash);
+    assert!(matches!(
+        store
+            .cancel_trade(
+                &waiting.id,
+                &rpc,
+                &config,
+                &CancelTradeBody {
+                    from: "lister".into(),
+                },
+            )
+            .await
+            .unwrap_err(),
+        OrderError::BadState(message) if message.contains("Received")
+    ));
+    store.mark_locked(&waiting.id, &rpc, &config).await.unwrap();
+    assert!(matches!(
+        store
+            .cancel_trade(
+                &waiting.id,
+                &rpc,
+                &config,
+                &CancelTradeBody {
+                    from: "lister".into(),
+                },
+            )
+            .await
+            .unwrap_err(),
+        OrderError::BadState(message) if message.contains("WaitingFiat")
+    ));
+    let closed = store
+        .cancel_trade(
+            &waiting.id,
+            &rpc,
+            &config,
+            &CancelTradeBody {
+                from: "taker".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.state, OrderState::PayWindowClosed);
+    assert!(log_contains(&closed, "hold cannot be cancelled"));
+    assert_eq!(fiber.lock().unwrap().status_of(&hash), "Received");
+    assert!(!store.list_ads().iter().any(|listed| listed.id == waiting.ad_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pay_window_closes_without_cancel_invoice() {
+    let path = temp_path();
+    let _remove = RemoveFile(path.clone());
+    let fiber = Arc::new(Mutex::new(FiberNode::new()));
+    let config = serve(Arc::clone(&fiber)).await;
+    let rpc = FiberRpc::new();
+    let store = MarketStore::open(path).unwrap();
+
+    let waiting = start_trade(&store, &rpc, &config).await;
+    let hash = waiting.payment_hash.clone().unwrap();
+    mark_received(&fiber, &hash);
+    store.mark_locked(&waiting.id, &rpc, &config).await.unwrap();
+    store.set_pay_by(&waiting.id, "2000-01-01T00:00:00Z");
+    let cancels_before = fiber.lock().unwrap().cancels.len();
+    let changed = store.poll_all_windows(&rpc, &config).await.unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].state, OrderState::PayWindowClosed);
+    assert!(log_contains(&changed[0], "cancel_invoice not called"));
+    assert_eq!(fiber.lock().unwrap().cancels.len(), cancels_before);
+    assert_eq!(fiber.lock().unwrap().status_of(&hash), "Received");
+    assert!(matches!(
+        store.fiat_sent(&waiting.id, &fiat_body("late")),
+        Err(OrderError::BadState(message))
+            if message.contains("PayWindowClosed") || message.contains("payment window")
+    ));
 }
 
 async fn open_dispute(

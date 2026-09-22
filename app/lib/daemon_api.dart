@@ -84,6 +84,14 @@ class DaemonApi {
     return _trade(baseUrl, '/trades/$id/locked');
   }
 
+  Future<TradeSnapshot> cancelTrade(
+    String baseUrl,
+    String id, {
+    required String from,
+  }) {
+    return _trade(baseUrl, '/trades/$id/cancel', {'from': from});
+  }
+
   Future<TradeSnapshot> fiatSent(
     String baseUrl,
     String id, {
