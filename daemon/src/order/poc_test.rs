@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::order::{
-    BuyerInvoiceBody, CreateAdBody, CreateTradeBody, OrderError, OrderState, PostChatBody,
-    TradeView, fiat_from_ckb,
+    BuyerInvoiceBody, CreateAdBody, CreateTradeBody, FiatSentBody, OpenDisputeBody, OrderError,
+    OrderState, PostChatBody, TradeView, fiat_from_ckb,
 };
 use crate::health::Config;
 use crate::market::MarketStore;
@@ -102,10 +102,32 @@ async fn walks_hold_release_dispute_and_expiry() {
     assert!(log_contains(&skipped, "cancel_invoice not applied"));
     assert_eq!(fiber.lock().unwrap().cancels.len(), cancels_before);
 
-    let fiat_sent = store
-        .fiat_sent(&trade_id, &buyer_invoice("1"))
-        .unwrap();
+    let marked = call_len(&fiber);
+    assert!(matches!(
+        store.award_seller(&trade_id, &rpc, &config).await.unwrap_err(),
+        OrderError::BadState(message) if message.contains("Disputed")
+    ));
+    assert!(!calls_since(&fiber, marked)
+        .iter()
+        .any(|call| call.contains("settle_invoice")));
+
+    let fiat_sent = store.fiat_sent(&trade_id, &fiat_body("1")).unwrap();
     assert_eq!(fiat_sent.state, OrderState::FiatSent);
+    assert_eq!(fiat_sent.proof.as_ref().map(|proof| proof.content_type.as_str()), Some("image/jpeg"));
+    let (kind, bytes) = store.get_proof(&trade_id).unwrap();
+    assert_eq!(kind, "image/jpeg");
+    assert_eq!(bytes, tiny_jpeg());
+    assert!(matches!(
+        store.fiat_sent(
+            &trade_id,
+            &FiatSentBody {
+                invoice: "fibb1late".into(),
+                proof_b64: String::new(),
+                content_type: "image/jpeg".into(),
+            },
+        ),
+        Err(OrderError::BadState(message)) if message.contains("WaitingFiat") || message.contains("proof")
+    ));
 
     fiber.lock().unwrap().fail_twine_payments = 1;
     let marked = call_len(&fiber);
@@ -138,6 +160,16 @@ async fn walks_hold_release_dispute_and_expiry() {
     assert_hides_preimage(&settled, &path);
     assert_pay_then_settle_calls(&calls_since(&fiber, marked));
     assert_eq!(fiber.lock().unwrap().status_of(&hold_hash), "Paid");
+    assert!(matches!(
+        store.post_chat(
+            &trade_id,
+            &PostChatBody {
+                from: "taker".into(),
+                text: "too late".into(),
+            },
+        ),
+        Err(OrderError::BadState(message)) if message.contains("open trade")
+    ));
     assert!(store
         .poll_hold_expiry(&trade_id, &rpc, &config)
         .await
@@ -181,7 +213,7 @@ async fn walks_hold_release_dispute_and_expiry() {
         .post_chat(
             &seller_id,
             &PostChatBody {
-                from: "buyer".into(),
+                from: "taker".into(),
                 text: "I sent the fiat".into(),
             },
         )
@@ -190,14 +222,15 @@ async fn walks_hold_release_dispute_and_expiry() {
         .post_chat(
             &seller_id,
             &PostChatBody {
-                from: "seller".into(),
+                from: "lister".into(),
                 text: "I never got it".into(),
             },
         )
         .unwrap();
-    assert_eq!(chat.chat.len(), 2);
-    assert_eq!(chat.chat[0].text, "I sent the fiat");
-    assert_eq!(chat.chat[1].from, "seller");
+    assert_eq!(chat.chat.len(), 3);
+    assert_eq!(chat.chat[0].text, "I paid on Opay");
+    assert_eq!(chat.chat[1].text, "I sent the fiat");
+    assert_eq!(chat.chat[2].from, "lister");
     assert_hides_preimage(&chat, &path);
     let marked = call_len(&fiber);
     let seller_wins = store.award_seller(&seller_id, &rpc, &config).await.unwrap();
@@ -431,9 +464,51 @@ async fn open_dispute(
     mark_received(fiber, &hash);
     let locked = store.mark_locked(&waiting.id, rpc, config).await.unwrap();
     assert_eq!(locked.invoice_status.as_deref(), Some("Received"));
-    let disputed = store.open_dispute(&waiting.id, rpc, config).await.unwrap();
+    let before_appeal = store
+        .post_chat(
+            &waiting.id,
+            &PostChatBody {
+                from: "taker".into(),
+                text: "I paid on Opay".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(before_appeal.state, OrderState::WaitingFiat);
+    assert_eq!(before_appeal.chat.len(), 1);
+    assert!(matches!(
+        store
+            .open_dispute(
+                &waiting.id,
+                rpc,
+                config,
+                &OpenDisputeBody {
+                    from: "taker".into(),
+                    reason: "   ".into(),
+                },
+            )
+            .await
+            .unwrap_err(),
+        OrderError::BadState(message) if message.contains("reason")
+    ));
+    let disputed = store
+        .open_dispute(
+            &waiting.id,
+            rpc,
+            config,
+            &OpenDisputeBody {
+                from: "taker".into(),
+                reason: "seller has not released".into(),
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(disputed.state, OrderState::Disputed);
     assert_eq!(disputed.invoice_status.as_deref(), Some("Received"));
+    assert_eq!(disputed.dispute_from.as_deref(), Some("taker"));
+    assert_eq!(
+        disputed.dispute_reason.as_deref(),
+        Some("seller has not released")
+    );
     assert_hides_preimage(&disputed, path);
     disputed
 }
@@ -485,6 +560,21 @@ fn post_ad(store: &MarketStore, available: &str) -> crate::market::AdView {
 fn buyer_invoice(seq: &str) -> BuyerInvoiceBody {
     BuyerInvoiceBody {
         invoice: format!("fibb1buyer{seq}"),
+    }
+}
+
+fn tiny_jpeg() -> Vec<u8> {
+    vec![0xFF, 0xD8, 0xFF, 0xD9]
+}
+
+fn fiat_body(seq: &str) -> FiatSentBody {
+    FiatSentBody {
+        invoice: format!("fibb1buyer{seq}"),
+        proof_b64: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            tiny_jpeg(),
+        ),
+        content_type: "image/jpeg".into(),
     }
 }
 

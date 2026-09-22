@@ -88,8 +88,29 @@ class DaemonApi {
     String baseUrl,
     String id, {
     required String invoice,
+    required String proofB64,
+    required String contentType,
   }) {
-    return _trade(baseUrl, '/trades/$id/fiat_sent', {'invoice': invoice});
+    return _trade(baseUrl, '/trades/$id/fiat_sent', {
+      'invoice': invoice,
+      'proof_b64': proofB64,
+      'content_type': contentType,
+    });
+  }
+
+  Future<ProofImage> fetchProof(String baseUrl, String id) async {
+    final response = await _client.get(Uri.parse('${_root(baseUrl)}/trades/$id/proof'));
+    if (response.statusCode >= 400) {
+      final decoded = response.body.isEmpty ? null : jsonDecode(response.body);
+      final message = decoded is Map && decoded['error'] is String
+          ? decoded['error'] as String
+          : 'daemon returned ${response.statusCode}';
+      throw DaemonException(message);
+    }
+    return ProofImage(
+      bytes: response.bodyBytes,
+      contentType: response.headers['content-type'] ?? 'application/octet-stream',
+    );
   }
 
   Future<TradeSnapshot> release(String baseUrl, String id) {
@@ -104,8 +125,16 @@ class DaemonApi {
     return _trade(baseUrl, '/trades/$id/retry', {'invoice': invoice});
   }
 
-  Future<TradeSnapshot> openDispute(String baseUrl, String id) {
-    return _trade(baseUrl, '/trades/$id/dispute');
+  Future<TradeSnapshot> openDispute(
+    String baseUrl,
+    String id, {
+    required String from,
+    required String reason,
+  }) {
+    return _trade(baseUrl, '/trades/$id/dispute', {
+      'from': from,
+      'reason': reason,
+    });
   }
 
   Future<TradeSnapshot> postChat(

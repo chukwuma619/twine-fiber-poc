@@ -20,8 +20,8 @@ You need **two phones** (two users): two iOS Simulators, two Android emulators, 
 1. Fund and start the three lab nodes, open channels, start the daemon (see [Run it](#run-it)).
 2. Launch the app on two devices, each pointed at a different Fiber RPC (see [Two phones](#two-phones-required-for-a-real-trade)).
 3. User A posts a sell ad. User B takes it from BUY CKB.
-4. A locks the hold. B marks fiat sent. A releases.
-5. Watch one of the four endings on testnet.
+4. A locks the hold. B uploads a receipt and notifies A. A marks payment received.
+5. Watch one of the four endings on testnet. Twine awards a trade only after someone files a dispute.
 
 ```text
 [ Seller node ]              [ Twine daemon ]                    [ Buyer node ]
@@ -29,15 +29,15 @@ You need **two phones** (two users): two iOS Simulators, two Android emulators, 
 1. Create hold invoice (H)          daemon calls twine fnn new_invoice
 2. Lock HTLC, status Received       seller app send_payment on the seller fnn
 3. Fiat window                      starts when the hold is Received
-4. Fiat sent                        buyer app new_invoice, then a button
-5. Seller releases                  daemon pays the buyer invoice, then settle
+4. Fiat sent                        buyer app uploads a JPEG/PNG, new_invoice, then notify seller
+5. Seller marks payment received    daemon pays the buyer invoice, then settle
 ```
 
 | Path | What they do | What Fiber does |
 | --- | --- | --- |
 | A | Buyer is reachable. Seller releases | Daemon pays the buyer’s invoice, then `settle_invoice(H, S)`. Invoice `Paid`. State `Settled` |
 | B | Payment to the buyer cannot route | `send_payment` fails. No `settle_invoice`. Hold stays `Received`. State `Leg2Failed`. A new invoice retries path A |
-| C | Either side disputes. Operator reads the chat | Buyer wins runs path A. If that payment fails, the order stays `Disputed` and is not settled. Seller wins leaves the hold `Received` until expiry |
+| C | Either side files a dispute with a reason. Operator reads the chat and proof | Buyer wins runs path A. If that payment fails, the order stays `Disputed` and is not settled. Seller wins leaves the hold `Received` until expiry |
 | D | Nobody settles before the timelock | Fiber marks the invoice `Expired` and the seller is refunded. A later `settle_invoice` fails. `cancel_invoice` is not called |
 
 One open trade per ad. The listing is not locked. Creating a trade reserves that slice (`ckb = pay / price`) and hides the ad until the trade ends. The reserved CKB returns if the trade is `Cancelled` or `Expired`. A `Settled` trade keeps the slice subtracted; leftover stays on the book if it still covers the minimum take.
@@ -179,7 +179,7 @@ Settings stores this user’s `fnn` RPC, P2P address, and the Twine daemon URL. 
 | --- | --- |
 | Market | BUY CKB is other people’s ads. SELL CKB is yours (badge **YOUR OFFER**). Tap + to post. Tap someone else’s offer to take |
 | Post ad | Available (CKB), currency, price (that currency per CKB, shown as `50 NGN/CKB`), min–max per take, payment rail and handle |
-| Trade | Lister: Lock, Release. Taker: Fiat sent, Retry. Either side: dispute and chat |
+| Trade | Lister: Lock, Payment received. Taker: upload receipt, Transferred notify seller, Retry. Either side: chat on an open trade, File dispute |
 | Settings | Channel status. Open channel to Twine. Ask Twine for a return channel. Operator tools toggle |
 
 **Path A (two phones).**
@@ -188,10 +188,10 @@ Settings stores this user’s `fnn` RPC, P2P address, and the Twine daemon URL. 
 2. On User A, BUY CKB stays empty (that ad is theirs). On **SELL CKB** it shows **YOUR OFFER**.
 3. On User B, **BUY CKB** shows the same card without YOUR OFFER. Tap it, pay an amount inside the limit (e.g. `2000` NGN → 1 CKB hold), **Start trade**.
 4. On User A, **My trades** → the trade → **Lock** (`send_payment` on A’s `fnn`).
-5. On User B, pay fiat outside the app, then **Fiat sent** (B’s `fnn` creates the payout invoice).
-6. On User A, **Release**. The daemon pays B, then `settle_invoice`. State `Settled`, invoice `Paid`. Leftover 1 CKB stays listed if it still meets the minimum.
+5. On User B, pay fiat outside the app, **Upload receipt**, then **Transferred, notify seller** (B’s `fnn` creates the payout invoice). The receipt is a JPEG or PNG stored on the daemon.
+6. On User A, open the trade, check the screenshot, then **Payment received**. The daemon pays B, then `settle_invoice`. State `Settled`, invoice `Paid`. Leftover 1 CKB stays listed if it still meets the minimum. No operator toggle and no award on this path.
 
-**Path B.** After Fiat sent, disconnect the buyer on the Fiber graph so Twine cannot route, then Release. State becomes `Leg2Failed`. The hold stays `Received`. The log has no `settle_invoice`. Reconnect the buyer and press Retry with new invoice. That retry is path A.
+**Path B.** After the buyer notifies the seller, disconnect the buyer on the Fiber graph so Twine cannot route, then **Payment received**. State becomes `Leg2Failed`. The hold stays `Received`. The log has no `settle_invoice`. Reconnect the buyer and press Retry with new invoice. That retry is path A.
 
 ```bash
 BUYER_PUB=$(curl -s http://127.0.0.1:8247 -H 'content-type: application/json' \
@@ -208,7 +208,7 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 
 `TWINE_RELEASE_PAUSE_MS` (milliseconds) pauses the daemon after it has the buyer invoice and before `send_payment`, if you would rather stop the buyer process than disconnect the peer.
 
-**Path C.** Open dispute while the hold is still `Received`. Both sides post a line. Turn on Operator tools in Settings. Award buyer runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. Award seller does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
+**Path C.** Either side can chat while the hold is still `Received`. File a dispute with a reason — that filing is the only request for Twine to step in. Award buyer and Award seller stay behind Operator tools and only appear after the appeal. Award buyer runs path A (pay, then settle). If that route fails, the order stays `Disputed` and is not settled. Award seller does not settle and does not cancel; the log says the seller is refunded when the TLC expires. After the invoice is `Expired`, both awards fail.
 
 A seller-wins trade stays open on that ad, so a second take is blocked until the hold expires.
 
@@ -236,15 +236,16 @@ The daemon is the only process that talks to the Twine `fnn`. User nodes are cal
 | `POST` | `/ads/:id/cancel` | |
 | `GET` | `/trades?pubkey=` | trades for that node |
 | `POST` | `/trades` | `{"ad_id","taker","pay_amount"}`. Creates the hold |
-| `GET` | `/trades/:id` | current trade. Never includes `S` |
+| `GET` | `/trades/:id` | current trade. Never includes `S`. Proof is `{content_type, bytes}` only |
+| `GET` | `/trades/:id/proof` | JPEG or PNG bytes |
 | `POST` | `/trades/:id/demo_cancel` | throwaway unpaid invoice, then `cancel_invoice` |
 | `POST` | `/trades/:id/locked` | poll Twine until the hold is `Received`, then start the fiat window |
 | `POST` | `/trades/:id/try_cancel` | refuses to cancel a `Received` hold |
-| `POST` | `/trades/:id/fiat_sent` | `{"invoice":"…"}` buyer invoice from the buyer node |
+| `POST` | `/trades/:id/fiat_sent` | `{"invoice","proof_b64","content_type"}` JPEG/PNG, 1.5 MB max |
 | `POST` | `/trades/:id/release` | path A, or `Leg2Failed` if the buyer payment fails |
 | `POST` | `/trades/:id/retry` | `{"invoice":"…"}` path A again, from `Leg2Failed` |
-| `POST` | `/trades/:id/dispute` | |
-| `POST` | `/trades/:id/chat` | `{"from":"lister","text":"…"}` or `"from":"taker"` |
+| `POST` | `/trades/:id/dispute` | `{"from":"lister"|"taker","reason":"…"}` |
+| `POST` | `/trades/:id/chat` | `{"from":"lister","text":"…"}` or `"from":"taker"` on an open trade |
 | `POST` | `/trades/:id/award_buyer` | `{"invoice":"…"}` |
 | `POST` | `/trades/:id/award_seller` | |
 
@@ -282,4 +283,4 @@ P2P ports are User A `8228`, Twine `8238`, User B `8248`.
 
 ## Out of scope
 
-Nostr, encrypted DMs, key rotation, bonds, fees, UDT, accounts, buy-side ads, rate oracles, partial fills, and app-store builds. Dispute chat is plain text stored on the daemon. Pubkeys on ads and trades are not authenticated.
+Nostr, encrypted DMs, key rotation, bonds, fees, UDT, accounts, buy-side ads, rate oracles, partial fills, and app-store builds. Chat is plain text stored on the daemon. Payment screenshots live in `daemon/proofs/`. Pubkeys on ads and trades are not authenticated.

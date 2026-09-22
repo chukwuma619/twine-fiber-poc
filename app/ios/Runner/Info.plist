@@ -16,6 +16,10 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>twine_app</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Take a photo of the payment receipt.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Upload a payment screenshot for this trade.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

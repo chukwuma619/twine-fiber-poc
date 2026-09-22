@@ -7,8 +7,18 @@ import 'package:http/testing.dart';
 import 'package:twine_app/daemon_api.dart';
 import 'package:twine_app/fiber_api.dart';
 import 'package:twine_app/main.dart';
+import 'package:twine_app/models.dart';
 import 'package:twine_app/settings.dart';
 import 'package:twine_app/trade_screen.dart';
+
+const tinyPng = <int>[
+  0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+  0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+  0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+  0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+  0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+  0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
 
 const lister = '02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const taker = '02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -31,6 +41,10 @@ Map<String, dynamic> tradeJson({
   required String state,
   required String pubkey,
   required String taker,
+  Map<String, dynamic>? proof,
+  String? disputeFrom,
+  String? disputeReason,
+  String? buyerInvoice,
 }) {
   return {
     'id': 't1',
@@ -46,7 +60,10 @@ Map<String, dynamic> tradeJson({
     'payment_hash': '0xhold1',
     'invoice_address': 'fibb1hold',
     'invoice_status': state == 'WaitingHold' ? 'Open' : 'Received',
-    'buyer_invoice': null,
+    'buyer_invoice': buyerInvoice,
+    'proof': proof,
+    'dispute_from': disputeFrom,
+    'dispute_reason': disputeReason,
     'log': [
       {'at': 't', 'text': 'hold invoice created H=0xhold1 S sealed in daemon'},
     ],
@@ -162,6 +179,203 @@ void main() {
     expect(find.text('WaitingFiat'), findsOneWidget);
     expect(find.byKey(const Key('lock')), findsNothing);
     expect(find.byKey(const Key('fiat-sent')), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byKey(const Key('fiat-sent'))).onPressed,
+      isNull,
+    );
+  });
+
+  testWidgets('taker uploads proof then notifies seller', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(800, 1600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    var state = 'WaitingFiat';
+    Map<String, dynamic>? fiatBody;
+    final client = MockClient((request) async {
+      final decoded = request.body.isEmpty ? null : jsonDecode(request.body);
+      if (decoded is Map && decoded['method'] == 'new_invoice') {
+        return jsonOk({
+          'jsonrpc': '2.0',
+          'id': 1,
+          'result': {'invoice_address': 'fibb1buyer'},
+        });
+      }
+      if (request.url.path == '/trades/t1/fiat_sent') {
+        fiatBody = decoded as Map<String, dynamic>?;
+        state = 'FiatSent';
+        return jsonOk(
+          tradeJson(
+            state: state,
+            pubkey: lister,
+            taker: taker,
+            proof: {'content_type': 'image/png', 'bytes': tinyPng.length},
+            buyerInvoice: 'fibb1buyer',
+          ),
+        );
+      }
+      if (request.url.path == '/trades/t1/proof') {
+        return http.Response.bytes(tinyPng, 200, headers: {
+          'content-type': 'image/png',
+        });
+      }
+      if (request.url.path == '/trades/t1') {
+        return jsonOk(
+          tradeJson(
+            state: state,
+            pubkey: lister,
+            taker: taker,
+            proof: state == 'FiatSent'
+                ? {'content_type': 'image/png', 'bytes': tinyPng.length}
+                : null,
+            buyerInvoice: state == 'FiatSent' ? 'fibb1buyer' : null,
+          ),
+        );
+      }
+      return http.Response(jsonEncode({'error': request.url.path}), 404);
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TradeScreen(
+          settings: SettingsController(
+            persist: false,
+            initial: const UserSettings(
+              name: 'Buyer',
+              daemonUrl: 'http://127.0.0.1:8080',
+              pubkey: taker,
+            ),
+          ),
+          daemon: widgetDaemon(client),
+          fiber: widgetFiber(client),
+          tradeId: 't1',
+          pickProof: () async => const PickedProof(
+            bytes: tinyPng,
+            contentType: 'image/png',
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(
+      tester.widget<FilledButton>(find.byKey(const Key('fiat-sent'))).onPressed,
+      isNull,
+    );
+    await tester.tap(find.byKey(const Key('pick-proof')));
+    await tester.pump();
+    expect(find.text('Receipt selected'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('fiat-sent')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(fiatBody?['invoice'], 'fibb1buyer');
+    expect(fiatBody?['content_type'], 'image/png');
+    expect(fiatBody?['proof_b64'], isNotEmpty);
+    expect(find.text('FiatSent'), findsOneWidget);
+    expect(find.byKey(const Key('proof-image')), findsOneWidget);
+  });
+
+  testWidgets('lister sees payment received after proof and no awards', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(800, 1600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final client = MockClient((request) async {
+      if (request.url.path == '/trades/t1/proof') {
+        return http.Response.bytes(tinyPng, 200, headers: {
+          'content-type': 'image/png',
+        });
+      }
+      if (request.url.path == '/trades/t1') {
+        return jsonOk(
+          tradeJson(
+            state: 'FiatSent',
+            pubkey: lister,
+            taker: taker,
+            proof: {'content_type': 'image/png', 'bytes': tinyPng.length},
+            buyerInvoice: 'fibb1buyer',
+          ),
+        );
+      }
+      return http.Response(jsonEncode({'error': request.url.path}), 404);
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TradeScreen(
+          settings: SettingsController(
+            persist: false,
+            initial: const UserSettings(
+              name: 'Seller',
+              daemonUrl: 'http://127.0.0.1:8080',
+              pubkey: lister,
+              operatorTools: true,
+            ),
+          ),
+          daemon: widgetDaemon(client),
+          fiber: widgetFiber(client),
+          tradeId: 't1',
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.text('Payment received'), findsOneWidget);
+    expect(find.byKey(const Key('release')), findsOneWidget);
+    expect(find.byKey(const Key('fiat-sent')), findsNothing);
+    expect(find.byKey(const Key('award-buyer')), findsNothing);
+    expect(find.byKey(const Key('award-seller')), findsNothing);
+    expect(find.byKey(const Key('proof-image')), findsOneWidget);
+    expect(find.byKey(const Key('open-dispute')), findsOneWidget);
+  });
+
+  testWidgets('award buttons appear only after a filed dispute', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(800, 1600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final client = MockClient((request) async {
+      if (request.url.path == '/trades/t1') {
+        return jsonOk(
+          tradeJson(
+            state: 'Disputed',
+            pubkey: lister,
+            taker: taker,
+            disputeFrom: 'taker',
+            disputeReason: 'seller has not released',
+          ),
+        );
+      }
+      return http.Response(jsonEncode({'error': request.url.path}), 404);
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TradeScreen(
+          settings: SettingsController(
+            persist: false,
+            initial: const UserSettings(
+              name: 'Seller',
+              daemonUrl: 'http://127.0.0.1:8080',
+              pubkey: lister,
+              operatorTools: true,
+            ),
+          ),
+          daemon: widgetDaemon(client),
+          fiber: widgetFiber(client),
+          tradeId: 't1',
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.textContaining('seller has not released'), findsOneWidget);
+    expect(find.byKey(const Key('award-buyer')), findsOneWidget);
+    expect(find.byKey(const Key('award-seller')), findsOneWidget);
+    expect(find.byKey(const Key('release')), findsNothing);
   });
 }
 

@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import 'amounts.dart';
 import 'daemon_api.dart';
@@ -18,12 +21,14 @@ class TradeScreen extends StatefulWidget {
     required this.daemon,
     required this.fiber,
     required this.tradeId,
+    this.pickProof,
   });
 
   final SettingsController settings;
   final DaemonApi daemon;
   final FiberApi fiber;
   final String tradeId;
+  final Future<PickedProof?> Function()? pickProof;
 
   @override
   State<TradeScreen> createState() => _TradeScreenState();
@@ -31,7 +36,10 @@ class TradeScreen extends StatefulWidget {
 
 class _TradeScreenState extends State<TradeScreen> {
   final TextEditingController _chat = TextEditingController();
+  final TextEditingController _reason = TextEditingController();
   TradeSnapshot? _trade;
+  PickedProof? _picked;
+  Uint8List? _proofBytes;
   String? _error;
   var _loading = true;
   var _busy = false;
@@ -52,6 +60,7 @@ class _TradeScreenState extends State<TradeScreen> {
     _fiatTicker?.cancel();
     _orderPoll?.cancel();
     _chat.dispose();
+    _reason.dispose();
     super.dispose();
   }
 
@@ -79,6 +88,7 @@ class _TradeScreenState extends State<TradeScreen> {
         }
       });
       _syncOrderPoll(trade);
+      await _maybeLoadProof(trade);
     } catch (err) {
       if (!mounted) {
         return;
@@ -113,6 +123,7 @@ class _TradeScreenState extends State<TradeScreen> {
         }
       });
       _syncOrderPoll(trade);
+      await _maybeLoadProof(trade);
     } catch (_) {}
   }
 
@@ -148,6 +159,7 @@ class _TradeScreenState extends State<TradeScreen> {
         }
       });
       _syncOrderPoll(trade);
+      await _maybeLoadProof(trade);
     } catch (err) {
       if (!mounted) {
         return;
@@ -157,6 +169,30 @@ class _TradeScreenState extends State<TradeScreen> {
         _busy = false;
       });
     }
+  }
+
+  Future<void> _maybeLoadProof(TradeSnapshot trade) async {
+    if (!trade.hasProof) {
+      if (_proofBytes != null) {
+        setState(() => _proofBytes = null);
+      }
+      return;
+    }
+    if (_proofBytes != null) {
+      return;
+    }
+    try {
+      final proof = await widget.daemon.fetchProof(
+        _user.daemonUrl,
+        widget.tradeId,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _proofBytes = Uint8List.fromList(proof.bytes);
+      });
+    } catch (_) {}
   }
 
   Future<String> _buyerInvoice() async {
@@ -169,6 +205,38 @@ class _TradeScreenState extends State<TradeScreen> {
       amountHex: shannonHex(trade.amount),
       description: 'twine path A buyer ${trade.amount} CKB',
     );
+  }
+
+  Future<void> _chooseProof() async {
+    final picker = widget.pickProof ?? _pickFromLibrary;
+    final picked = await picker();
+    if (!mounted || picked == null) {
+      return;
+    }
+    setState(() => _picked = picked);
+  }
+
+  Future<PickedProof?> _pickFromLibrary() async {
+    final file = await ImagePicker().pickImage(source: ImageSource.gallery);
+    if (file == null) {
+      return null;
+    }
+    final bytes = await file.readAsBytes();
+    if (bytes.isEmpty) {
+      return null;
+    }
+    return PickedProof(
+      bytes: bytes,
+      contentType: file.mimeType ?? _mimeFromName(file.name),
+    );
+  }
+
+  String _mimeFromName(String name) {
+    final lower = name.toLowerCase();
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+    return 'image/jpeg';
   }
 
   void _startFiatTimer() {
@@ -216,8 +284,11 @@ class _TradeScreenState extends State<TradeScreen> {
     final listed = trade?.isLister(_user.pubkey) ?? false;
     final took = trade?.isTaker(_user.pubkey) ?? false;
     final operator = _user.operatorTools;
-    final canChat = (took || listed) && (trade?.isDisputed ?? false) && !_busy;
+    final canChat = (took || listed) && (trade?.canChat ?? false) && !_busy;
     final chatReady = canChat && _chat.text.trim().isNotEmpty;
+    final canAppeal =
+        (took || listed) && (trade?.canOpenDispute ?? false) && !_busy;
+    final appealReady = canAppeal && _reason.text.trim().isNotEmpty;
     final stateLabel = _loading ? 'Loading' : (trade?.state ?? 'Idle');
 
     return Scaffold(
@@ -247,19 +318,41 @@ class _TradeScreenState extends State<TradeScreen> {
             ),
           if (took && (trade?.isWaitingFiat ?? false)) ...[
             const SizedBox(height: 8),
+            OutlinedButton(
+              key: const Key('pick-proof'),
+              onPressed: _busy ? null : _chooseProof,
+              child: Text(
+                _picked == null ? 'Upload receipt' : 'Receipt selected',
+              ),
+            ),
+            const SizedBox(height: 8),
             FilledButton(
               key: const Key('fiat-sent'),
-              onPressed: _busy
+              onPressed: _busy || _picked == null
                   ? null
                   : () => _run(() async {
                       final invoice = await _buyerInvoice();
+                      final picked = _picked!;
                       return widget.daemon.fiatSent(
                         _user.daemonUrl,
                         widget.tradeId,
                         invoice: invoice,
+                        proofB64: base64Encode(picked.bytes),
+                        contentType: picked.contentType,
                       );
                     }),
-              child: const Text('Fiat sent'),
+              child: const Text('Transferred, notify seller'),
+            ),
+          ],
+          if (_proofBytes != null) ...[
+            const SizedBox(height: 12),
+            const Text('Payment proof', key: Key('proof-heading')),
+            const SizedBox(height: 8),
+            Image.memory(
+              _proofBytes!,
+              key: const Key('proof-image'),
+              height: 180,
+              fit: BoxFit.contain,
             ),
           ],
           if (listed &&
@@ -277,8 +370,8 @@ class _TradeScreenState extends State<TradeScreen> {
                     ),
               child: Text(
                 (trade?.isReleasing ?? false)
-                    ? 'Release (continue path A)'
-                    : 'Release',
+                    ? 'Payment received (continue path A)'
+                    : 'Payment received',
               ),
             ),
           ],
@@ -308,24 +401,9 @@ class _TradeScreenState extends State<TradeScreen> {
               ),
             ],
           ],
-          if ((took || listed) && (trade?.canOpenDispute ?? false)) ...[
-            const SizedBox(height: 8),
-            OutlinedButton(
-              key: const Key('open-dispute'),
-              onPressed: _busy
-                  ? null
-                  : () => _run(
-                      () => widget.daemon.openDispute(
-                        _user.daemonUrl,
-                        widget.tradeId,
-                      ),
-                    ),
-              child: const Text('Open dispute'),
-            ),
-          ],
-          if (trade?.isDisputed ?? false) ...[
+          if ((took || listed) && (trade?.canChat ?? false)) ...[
             const SizedBox(height: 12),
-            const Text('Dispute chat', key: Key('dispute-chat-heading')),
+            const Text('Chat', key: Key('dispute-chat-heading')),
             if (trade!.chat.isEmpty)
               const Text('No chat lines yet.', key: Key('chat-empty'))
             else
@@ -337,34 +415,63 @@ class _TradeScreenState extends State<TradeScreen> {
                     key: const Key('chat-line'),
                   ),
                 ),
-            if (took || listed) ...[
-              const SizedBox(height: 8),
-              TextField(
-                key: const Key('chat-input'),
-                controller: _chat,
-                decoration: const InputDecoration(labelText: 'Chat line'),
-                onChanged: (_) => setState(() {}),
+            TextField(
+              key: const Key('chat-input'),
+              controller: _chat,
+              decoration: const InputDecoration(labelText: 'Chat line'),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('post-chat'),
+              onPressed: chatReady
+                  ? () {
+                      final text = _chat.text;
+                      _chat.clear();
+                      _run(
+                        () => widget.daemon.postChat(
+                          _user.daemonUrl,
+                          widget.tradeId,
+                          from: took ? 'taker' : 'lister',
+                          text: text,
+                        ),
+                      );
+                    }
+                  : null,
+              child: const Text('Post chat line'),
+            ),
+          ],
+          if (canAppeal) ...[
+            const SizedBox(height: 8),
+            TextField(
+              key: const Key('dispute-reason'),
+              controller: _reason,
+              decoration: const InputDecoration(labelText: 'Appeal reason'),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              key: const Key('open-dispute'),
+              onPressed: appealReady
+                  ? () => _run(
+                      () => widget.daemon.openDispute(
+                        _user.daemonUrl,
+                        widget.tradeId,
+                        from: took ? 'taker' : 'lister',
+                        reason: _reason.text,
+                      ),
+                    )
+                  : null,
+              child: const Text('File dispute'),
+            ),
+          ],
+          if (trade?.isDisputed ?? false) ...[
+            const SizedBox(height: 12),
+            if (trade!.disputeReason != null)
+              Text(
+                'Appeal (${trade.disputeFrom ?? 'party'}): ${trade.disputeReason}',
+                key: const Key('dispute-reason-line'),
               ),
-              const SizedBox(height: 8),
-              FilledButton(
-                key: const Key('post-chat'),
-                onPressed: chatReady
-                    ? () {
-                        final text = _chat.text;
-                        _chat.clear();
-                        _run(
-                          () => widget.daemon.postChat(
-                            _user.daemonUrl,
-                            widget.tradeId,
-                            from: took ? 'taker' : 'lister',
-                            text: text,
-                          ),
-                        );
-                      }
-                    : null,
-                child: const Text('Post chat line'),
-              ),
-            ],
             if (operator) ...[
               const SizedBox(height: 8),
               FilledButton(

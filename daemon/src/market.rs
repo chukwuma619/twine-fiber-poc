@@ -8,13 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::health::Config;
 use crate::order::{
-    add_ckb, attempt_settle_after_expiry, cancel_hold_invoice, ckb_from_fiat, cmp_ckb,
-    create_hold_invoice, demo_cancel_invoice, fetch_invoice_status, fiat_from_ckb, new_id,
-    normalize_amount, normalize_pubkey, payment_hash_of, poll_invoice_paid, poll_invoice_received,
-    poll_payment_done, require_received_for_award, require_received_for_dispute,
-    send_payment_to_invoice, settle_hold, timestamp, BuyerInvoiceBody, CreateAdBody,
-    CreateTradeBody, OrderError, OrderState, PayFailureMode, PostChatBody, Trade, TradeView,
-    FINAL_EXPIRY_DELTA_MS,
+    add_ckb, allows_chat, attempt_settle_after_expiry, cancel_hold_invoice, ckb_from_fiat,
+    cmp_ckb, create_hold_invoice, decode_payment_proof, demo_cancel_invoice,
+    fetch_invoice_status, fiat_from_ckb, new_id, normalize_amount, normalize_pubkey,
+    party_from, payment_hash_of, poll_invoice_paid, poll_invoice_received, poll_payment_done,
+    require_received_for_award, require_received_for_dispute, send_payment_to_invoice,
+    settle_hold, timestamp, BuyerInvoiceBody, CreateAdBody, CreateTradeBody, FiatSentBody,
+    OpenDisputeBody, OrderError, OrderState, PayFailureMode, PostChatBody, ProofMeta, Trade,
+    TradeView, FINAL_EXPIRY_DELTA_MS,
 };
 use crate::rpc::FiberRpc;
 
@@ -233,6 +234,22 @@ impl MarketStore {
             .and_then(|trade| trade.payment_preimage.clone())
     }
 
+    fn proofs_dir(&self) -> PathBuf {
+        match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join("proofs"),
+            _ => PathBuf::from("proofs"),
+        }
+    }
+
+    fn proof_path(&self, trade_id: &str) -> PathBuf {
+        self.proofs_dir().join(trade_id)
+    }
+
+    fn write_proof(&self, trade_id: &str, bytes: &[u8]) -> Result<(), OrderError> {
+        fs::create_dir_all(self.proofs_dir()).map_err(|err| OrderError::Save(err.to_string()))?;
+        fs::write(self.proof_path(trade_id), bytes).map_err(|err| OrderError::Save(err.to_string()))
+    }
+
     pub async fn create_trade(
         &self,
         rpc: &FiberRpc,
@@ -314,6 +331,9 @@ impl MarketStore {
                 invoice_address: None,
                 invoice_status: None,
                 buyer_invoice: None,
+                proof: None,
+                dispute_from: None,
+                dispute_reason: None,
                 log: vec![],
                 chat: vec![],
             };
@@ -528,8 +548,23 @@ impl MarketStore {
         }
     }
 
-    pub fn fiat_sent(&self, id: &str, body: &BuyerInvoiceBody) -> Result<TradeView, OrderError> {
+    pub fn fiat_sent(&self, id: &str, body: &FiatSentBody) -> Result<TradeView, OrderError> {
         let invoice = require_text(&body.invoice, "invoice")?;
+        let (content_type, data) = decode_payment_proof(&body.proof_b64, &body.content_type)?;
+        {
+            let market = self.guard();
+            let trade = market
+                .trades
+                .get(id)
+                .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
+            if trade.state != OrderState::WaitingFiat {
+                return Err(OrderError::BadState(format!(
+                    "fiat sent needs WaitingFiat, got {:?}",
+                    trade.state
+                )));
+            }
+        }
+        self.write_proof(id, &data)?;
         let mut market = self.guard();
         let trade = market
             .trades
@@ -537,17 +572,40 @@ impl MarketStore {
             .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
         if trade.state != OrderState::WaitingFiat {
             return Err(OrderError::BadState(format!(
-                "fiat sent needs WaitingFiat, got {:?}",
+                "trade changed while storing proof, got {:?}",
                 trade.state
             )));
         }
         trade.buyer_invoice = Some(invoice);
+        trade.proof = Some(ProofMeta {
+            content_type,
+            bytes: data.len(),
+        });
         trade.state = OrderState::FiatSent;
-        trade.push_log("buyer marked fiat sent");
+        trade.push_log("buyer marked fiat sent with payment proof");
         let view = trade.view();
         save(&self.path, &market).map_err(OrderError::Save)?;
         eprintln!("trade {id} state=FiatSent");
         Ok(view)
+    }
+
+    pub fn get_proof(&self, id: &str) -> Result<(String, Vec<u8>), OrderError> {
+        let content_type = {
+            let market = self.guard();
+            let trade = market
+                .trades
+                .get(id)
+                .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
+            trade
+                .proof
+                .as_ref()
+                .map(|proof| proof.content_type.clone())
+                .ok_or_else(|| OrderError::NotFound(format!("proof for trade {id} not found")))?
+        };
+        let bytes = fs::read(self.proof_path(id)).map_err(|_| {
+            OrderError::NotFound(format!("proof for trade {id} not found"))
+        })?;
+        Ok((content_type, bytes))
     }
 
     pub async fn release(
@@ -616,7 +674,15 @@ impl MarketStore {
         id: &str,
         rpc: &FiberRpc,
         config: &Config,
+        body: &OpenDisputeBody,
     ) -> Result<TradeView, OrderError> {
+        let from = party_from(&body.from)?;
+        let reason = require_text(&body.reason, "reason")?;
+        if reason.len() > 500 {
+            return Err(OrderError::BadState(
+                "reason must be at most 500 characters".into(),
+            ));
+        }
         let (state, payment_hash) = {
             let market = self.guard();
             let trade = market
@@ -652,9 +718,11 @@ impl MarketStore {
             }
         }
         trade.state = OrderState::Disputed;
+        trade.dispute_from = Some(from.clone());
+        trade.dispute_reason = Some(reason.clone());
         trade.invoice_status = Some(status.clone());
         trade.push_log(format!(
-            "dispute opened (invoice still {status}); chat is plain text on the daemon"
+            "dispute opened by {from}: {reason} (invoice still {status}); Twine may award only after this appeal"
         ));
         let view = trade.view();
         save(&self.path, &market).map_err(OrderError::Save)?;
@@ -663,12 +731,7 @@ impl MarketStore {
     }
 
     pub fn post_chat(&self, id: &str, body: &PostChatBody) -> Result<TradeView, OrderError> {
-        let from = body.from.trim().to_ascii_lowercase();
-        if from != "lister" && from != "taker" && from != "buyer" && from != "seller" {
-            return Err(OrderError::BadState(
-                "chat from must be lister or taker".into(),
-            ));
-        }
+        let from = party_from(&body.from)?;
         let text = body.text.trim();
         if text.is_empty() {
             return Err(OrderError::BadState("chat text is required".into()));
@@ -683,9 +746,9 @@ impl MarketStore {
             .trades
             .get_mut(id)
             .ok_or_else(|| OrderError::NotFound(format!("trade {id} not found")))?;
-        if trade.state != OrderState::Disputed {
+        if !allows_chat(trade.state) {
             return Err(OrderError::BadState(format!(
-                "post chat needs Disputed, got {:?}",
+                "post chat needs an open trade, got {:?}",
                 trade.state
             )));
         }

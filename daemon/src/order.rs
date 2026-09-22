@@ -21,6 +21,12 @@ pub const FINAL_EXPIRY_DELTA_MS: u64 = 57_600_000;
 /// How often the daemon polls Twine `get_invoice` for Path D expiry.
 pub const HOLD_EXPIRY_POLL: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofMeta {
+    pub content_type: String,
+    pub bytes: usize,
+}
+
 /// Persisted trade. `payment_preimage` stays on disk / in the daemon only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trade {
@@ -49,6 +55,12 @@ pub struct Trade {
     pub invoice_status: Option<String>,
     #[serde(default)]
     pub buyer_invoice: Option<String>,
+    #[serde(default)]
+    pub proof: Option<ProofMeta>,
+    #[serde(default)]
+    pub dispute_from: Option<String>,
+    #[serde(default)]
+    pub dispute_reason: Option<String>,
     pub log: Vec<LogLine>,
     #[serde(default)]
     pub chat: Vec<ChatLine>,
@@ -71,6 +83,9 @@ pub struct TradeView {
     pub invoice_address: Option<String>,
     pub invoice_status: Option<String>,
     pub buyer_invoice: Option<String>,
+    pub proof: Option<ProofMeta>,
+    pub dispute_from: Option<String>,
+    pub dispute_reason: Option<String>,
     pub log: Vec<LogLine>,
     pub chat: Vec<ChatLine>,
 }
@@ -106,6 +121,9 @@ impl Trade {
             invoice_address: self.invoice_address.clone(),
             invoice_status: self.invoice_status.clone(),
             buyer_invoice: self.buyer_invoice.clone(),
+            proof: self.proof.clone(),
+            dispute_from: self.dispute_from.clone(),
+            dispute_reason: self.dispute_reason.clone(),
             log: self.log.clone(),
             chat: self.chat.clone(),
         }
@@ -165,6 +183,89 @@ pub struct ChatLine {
 pub struct PostChatBody {
     pub from: String,
     pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FiatSentBody {
+    pub invoice: String,
+    pub proof_b64: String,
+    pub content_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenDisputeBody {
+    pub from: String,
+    pub reason: String,
+}
+
+/// JPEG or PNG, 1.5 MB max.
+pub const MAX_PROOF_BYTES: usize = 1_572_864;
+
+pub fn decode_payment_proof(
+    proof_b64: &str,
+    content_type: &str,
+) -> Result<(String, Vec<u8>), OrderError> {
+    let raw = proof_b64.trim();
+    if raw.is_empty() {
+        return Err(OrderError::BadState("proof_b64 is required".into()));
+    }
+    let compact: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &compact)
+        .map_err(|_| OrderError::BadState("proof_b64 is not valid base64".into()))?;
+    if data.len() > MAX_PROOF_BYTES {
+        return Err(OrderError::BadState("proof must be at most 1.5 MB".into()));
+    }
+    let detected = detect_image(&data)?;
+    let requested = normalize_content_type(content_type)?;
+    if detected != requested {
+        return Err(OrderError::BadState(format!(
+            "proof content_type {content_type} does not match file"
+        )));
+    }
+    Ok((detected, data))
+}
+
+fn detect_image(data: &[u8]) -> Result<String, OrderError> {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return Ok("image/jpeg".into());
+    }
+    if data.len() >= 8
+        && data[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    {
+        return Ok("image/png".into());
+    }
+    Err(OrderError::BadState(
+        "proof must be a JPEG or PNG".into(),
+    ))
+}
+
+fn normalize_content_type(raw: &str) -> Result<String, OrderError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg".into()),
+        "image/png" => Ok("image/png".into()),
+        "" => Err(OrderError::BadState("content_type is required".into())),
+        _ => Err(OrderError::BadState("proof must be a JPEG or PNG".into())),
+    }
+}
+
+pub fn party_from(raw: &str) -> Result<String, OrderError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "lister" | "seller" => Ok("lister".into()),
+        "taker" | "buyer" => Ok("taker".into()),
+        _ => Err(OrderError::BadState(
+            "from must be lister or taker".into(),
+        )),
+    }
+}
+
+pub fn allows_chat(state: OrderState) -> bool {
+    matches!(
+        state,
+        OrderState::WaitingFiat
+            | OrderState::FiatSent
+            | OrderState::Leg2Failed
+            | OrderState::Disputed
+    )
 }
 
 /// How Path A payment failure updates trade state.
@@ -746,6 +847,23 @@ mod tests {
         let raw = hex::decode(preimage.trim_start_matches("0x")).unwrap();
         let expected = format!("0x{}", hex::encode(Sha256::digest(raw)));
         assert_eq!(payment_hash, expected);
+    }
+
+    #[test]
+    fn decode_payment_proof_accepts_jpeg_and_png() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let jpeg_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpeg);
+        let png_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
+        let (kind, bytes) = decode_payment_proof(&jpeg_b64, "image/jpg").unwrap();
+        assert_eq!(kind, "image/jpeg");
+        assert_eq!(bytes, jpeg);
+        let (kind, bytes) = decode_payment_proof(&png_b64, "image/png").unwrap();
+        assert_eq!(kind, "image/png");
+        assert_eq!(bytes, png);
+        assert!(decode_payment_proof("", "image/jpeg").is_err());
+        assert!(decode_payment_proof(&jpeg_b64, "image/png").is_err());
+        assert!(decode_payment_proof("@@@", "image/jpeg").is_err());
     }
 }
 

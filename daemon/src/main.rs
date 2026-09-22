@@ -7,7 +7,8 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -18,8 +19,8 @@ use health::{
 };
 use market::{AdView, MarketStore};
 use order::{
-    BuyerInvoiceBody, ConnectBody, CreateAdBody, CreateTradeBody, OrderError, PostChatBody,
-    TradeView, HOLD_EXPIRY_POLL,
+    BuyerInvoiceBody, ConnectBody, CreateAdBody, CreateTradeBody, FiatSentBody, OpenDisputeBody,
+    OrderError, PostChatBody, TradeView, HOLD_EXPIRY_POLL,
 };
 use rpc::FiberRpc;
 
@@ -66,6 +67,7 @@ async fn main() -> ExitCode {
         .route("/ads/{id}/cancel", post(cancel_ad))
         .route("/trades", get(list_trades).post(create_trade))
         .route("/trades/{id}", get(get_trade))
+        .route("/trades/{id}/proof", get(get_proof))
         .route("/trades/{id}/demo_cancel", post(demo_cancel))
         .route("/trades/{id}/locked", post(mark_locked))
         .route("/trades/{id}/try_cancel", post(try_cancel))
@@ -208,10 +210,25 @@ async fn try_cancel(
         .map_err(ApiError::from)
 }
 
+async fn get_proof(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (content_type, bytes) = app.market.get_proof(&id).map_err(ApiError::from)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
+            HeaderValue::from_static("application/octet-stream")
+        }),
+    );
+    Ok((headers, bytes))
+}
+
 async fn fiat_sent(
     State(app): State<App>,
     Path(id): Path<String>,
-    Json(body): Json<BuyerInvoiceBody>,
+    Json(body): Json<FiatSentBody>,
 ) -> Result<Json<TradeView>, ApiError> {
     app.market
         .fiat_sent(&id, &body)
@@ -245,9 +262,10 @@ async fn retry(
 async fn open_dispute(
     State(app): State<App>,
     Path(id): Path<String>,
+    Json(body): Json<OpenDisputeBody>,
 ) -> Result<Json<TradeView>, ApiError> {
     app.market
-        .open_dispute(&id, &app.rpc, &app.config)
+        .open_dispute(&id, &app.rpc, &app.config, &body)
         .await
         .map(Json)
         .map_err(ApiError::from)

@@ -3,4 +3,5 @@
 /daemon/target/
 /daemon/order.json
 /daemon/market.json
+/daemon/proofs/
 /target/

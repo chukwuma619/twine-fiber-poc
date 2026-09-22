@@ -28,6 +28,34 @@ class ChatLine {
   }
 }
 
+class ProofMeta {
+  const ProofMeta({required this.contentType, required this.bytes});
+
+  final String contentType;
+  final int bytes;
+
+  factory ProofMeta.fromJson(Map<String, dynamic> json) {
+    return ProofMeta(
+      contentType: json['content_type'] as String? ?? '',
+      bytes: (json['bytes'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+class ProofImage {
+  const ProofImage({required this.bytes, required this.contentType});
+
+  final List<int> bytes;
+  final String contentType;
+}
+
+class PickedProof {
+  const PickedProof({required this.bytes, required this.contentType});
+
+  final List<int> bytes;
+  final String contentType;
+}
+
 class AdSnapshot {
   const AdSnapshot({
     required this.id,
@@ -86,6 +114,9 @@ class TradeSnapshot {
     required this.buyerInvoice,
     required this.log,
     required this.chat,
+    this.proof,
+    this.disputeFrom,
+    this.disputeReason,
   });
 
   final String id;
@@ -104,6 +135,9 @@ class TradeSnapshot {
   final String? buyerInvoice;
   final List<OrderLogLine> log;
   final List<ChatLine> chat;
+  final ProofMeta? proof;
+  final String? disputeFrom;
+  final String? disputeReason;
 
   bool get isWaitingHold => state == 'WaitingHold';
   bool get isWaitingFiat => state == 'WaitingFiat';
@@ -115,6 +149,10 @@ class TradeSnapshot {
   bool get isExpired => state == 'Expired';
 
   bool get canOpenDispute => isWaitingFiat || isFiatSent || isLeg2Failed;
+
+  bool get canChat => isWaitingFiat || isFiatSent || isLeg2Failed || isDisputed;
+
+  bool get hasProof => proof != null;
 
   bool get sellerWinsLogged =>
       log.any((line) => line.text.contains('solver awarded seller'));
@@ -159,6 +197,11 @@ class TradeSnapshot {
       buyerInvoice: json['buyer_invoice'] as String?,
       log: _lines(json['log'], OrderLogLine.fromJson),
       chat: _lines(json['chat'], ChatLine.fromJson),
+      proof: json['proof'] is Map<String, dynamic>
+          ? ProofMeta.fromJson(json['proof'] as Map<String, dynamic>)
+          : null,
+      disputeFrom: json['dispute_from'] as String?,
+      disputeReason: json['dispute_reason'] as String?,
     );
   }
 }
