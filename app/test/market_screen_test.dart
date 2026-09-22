@@ -93,12 +93,12 @@ void main() {
     expect(find.text('BUY CKB'), findsOneWidget);
     expect(find.text('Order book'), findsOneWidget);
     expect(find.text('SELL CKB'), findsOneWidget);
-    expect(find.text('CKB'), findsOneWidget);
-    expect(find.text('Available 1 CKB'), findsOneWidget);
-    expect(find.text('NGN'), findsOneWidget);
     expect(find.text('2000'), findsOneWidget);
-    expect(find.text('per CKB'), findsOneWidget);
-    expect(find.text('Limit 1000–2000'), findsOneWidget);
+    expect(find.text('NGN/CKB'), findsOneWidget);
+    expect(find.text('Available'), findsOneWidget);
+    expect(find.text('1 CKB'), findsOneWidget);
+    expect(find.text('Limit'), findsOneWidget);
+    expect(find.text('1000–2000 NGN'), findsOneWidget);
     expect(find.textContaining('Opay'), findsOneWidget);
     expect(find.byKey(const Key('take-ad1')), findsOneWidget);
 

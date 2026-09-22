@@ -73,11 +73,10 @@ class _TakeAdDialogState extends State<TakeAdDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Currency ${ad.currency}'),
-          Text('Price ${ad.price} per CKB'),
+          Text('${ad.price} ${ad.currency}/CKB'),
           Text('Available ${ad.available} CKB'),
           if (ad.min.isNotEmpty && ad.max.isNotEmpty)
-            Text('Limit ${ad.min}–${ad.max}'),
+            Text('Limit ${ad.min}–${ad.max} ${ad.currency}'),
           TextField(
             key: const Key('pay-amount'),
             controller: _pay,

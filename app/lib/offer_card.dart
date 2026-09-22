@@ -16,7 +16,10 @@ class OfferCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final theme = Theme.of(context);
+    final muted = theme.colorScheme.onSurfaceVariant;
+    final currency = ad.currency.isEmpty ? 'NGN' : ad.currency;
+
     return Card(
       key: Key('ad-${ad.id}'),
       child: InkWell(
@@ -28,61 +31,45 @@ class OfferCard extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              if (mine) ...[
+                Text(
+                  'YOUR OFFER',
+                  style: theme.textTheme.labelMedium?.copyWith(color: muted),
+                ),
+                const SizedBox(height: 10),
+              ],
               Row(
+                crossAxisAlignment: CrossAxisAlignment.baseline,
+                textBaseline: TextBaseline.alphabetic,
                 children: [
-                  if (mine)
-                    Text(
-                      'YOUR OFFER',
-                      style: TextStyle(
-                        color: muted,
-                        fontSize: 12,
-                        letterSpacing: 0.6,
-                      ),
-                    )
-                  else
-                    const SizedBox.shrink(),
-                  const Spacer(),
                   Text(
-                    ad.currency,
-                    style: TextStyle(
-                      color: muted,
-                      fontSize: 12,
-                      letterSpacing: 0.6,
+                    ad.price,
+                    style: theme.textTheme.headlineMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: -0.6,
                     ),
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    'CKB',
-                    style: TextStyle(
-                      color: muted,
-                      fontSize: 12,
-                      letterSpacing: 0.6,
+                    '$currency/CKB',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 10),
-              Text(
-                ad.price,
-                style: const TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: -0.6,
-                ),
-              ),
-              Text(
-                'per CKB',
-                style: TextStyle(color: muted, fontSize: 14),
-              ),
-              Text(
-                'Available ${ad.available} CKB',
-                style: TextStyle(color: muted, fontSize: 14),
+              const SizedBox(height: 12),
+              _Fact(
+                label: 'Available',
+                value: '${ad.available} CKB',
+                color: muted,
               ),
               if (ad.min.isNotEmpty && ad.max.isNotEmpty) ...[
                 const SizedBox(height: 4),
-                Text(
-                  'Limit ${ad.min}–${ad.max}',
-                  style: TextStyle(color: muted, fontSize: 14),
+                _Fact(
+                  label: 'Limit',
+                  value: '${ad.min}–${ad.max} $currency',
+                  color: muted,
                 ),
               ],
               const SizedBox(height: 14),
@@ -97,7 +84,7 @@ class OfferCard extends StatelessWidget {
                   Expanded(
                     child: Text(
                       ad.paymentMethod,
-                      style: const TextStyle(fontSize: 14),
+                      style: theme.textTheme.bodyMedium,
                     ),
                   ),
                 ],
@@ -106,6 +93,29 @@ class OfferCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _Fact extends StatelessWidget {
+  const _Fact({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = Theme.of(context).textTheme.bodyMedium?.copyWith(color: color);
+    return Row(
+      children: [
+        SizedBox(width: 88, child: Text(label, style: style)),
+        Expanded(child: Text(value, style: style)),
+      ],
     );
   }
 }

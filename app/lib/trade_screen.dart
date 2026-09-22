@@ -425,7 +425,7 @@ class _TradeScreenState extends State<TradeScreen> {
           if (trade != null) ...[
             Text('Amount: ${trade.amount} CKB'),
             Text('Currency: ${trade.currency}'),
-            Text('Price: ${trade.price} per CKB'),
+            Text('Price: ${trade.price} ${trade.currency}/CKB'),
             Text('You pay: ${trade.payAmount}'),
             Text('Payment: ${trade.paymentMethod}'),
             if (trade.invoiceStatus != null) Text('Invoice: ${trade.invoiceStatus}'),
