@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::rpc::FiberRpc;
 
+pub use crate::proof::ProofMeta;
+
 const SHANNONS_PER_CKB: u128 = 100_000_000;
 const LOCK_POLL: Duration = Duration::from_millis(500);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(90);
@@ -20,12 +22,6 @@ pub const FINAL_EXPIRY_DELTA_MS: u64 = 57_600_000;
 
 /// How often the daemon polls Twine `get_invoice` for Path D expiry.
 pub const HOLD_EXPIRY_POLL: Duration = Duration::from_secs(15);
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProofMeta {
-    pub content_type: String,
-    pub bytes: usize,
-}
 
 /// Persisted trade. `payment_preimage` stays on disk / in the daemon only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,7 @@
 mod health;
 mod market;
 mod order;
+mod proof;
 mod rpc;
 
 use std::net::SocketAddr;
