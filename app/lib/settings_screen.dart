@@ -158,48 +158,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  Future<void> _askTwineChannel() async {
-    setState(() {
-      _busy = true;
-      _error = null;
-    });
-    try {
-      await _persist();
-      var pubkey = _user.pubkey;
-      if (pubkey == null || pubkey.isEmpty) {
-        pubkey = await widget.fiber.nodePubkey(_fiberRpc.text);
-        await widget.settings.update(_user.copyWith(pubkey: pubkey));
-      }
-      final result = await widget.daemon.connect(
-        _daemonUrl.text,
-        pubkey: pubkey,
-        address: _p2p.text,
-      );
-      final twine = await widget.daemon.fetchTwine(_daemonUrl.text);
-      final loaded = await _loadChannels(twine.pubkey);
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _twine = twine;
-        _channels = loaded.channels;
-        _toTwine = loaded.toTwine;
-        _status = result.channelOpen
-            ? 'You can receive CKB. Twine opened a return channel.'
-            : result.message;
-        _busy = false;
-      });
-    } catch (err) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _error = err.toString();
-        _busy = false;
-      });
-    }
-  }
-
   Future<({List<FiberChannel> channels, FiberChannel? toTwine})> _loadChannels(
     String? twinePubkey,
   ) async {
@@ -347,13 +305,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 FilledButton(
                   key: const Key('open-channel-twine'),
                   onPressed: _busy ? null : _openTowardTwine,
-                  child: const Text('Open channel to sell'),
-                ),
-                const SizedBox(height: 8),
-                OutlinedButton(
-                  key: const Key('ask-twine-channel'),
-                  onPressed: _busy ? null : _askTwineChannel,
-                  child: const Text('Ask Twine for a return channel'),
+                  child: const Text('Open channel to Twine'),
                 ),
               ],
             ),
