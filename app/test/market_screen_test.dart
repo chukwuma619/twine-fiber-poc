@@ -99,7 +99,6 @@ void main() {
         settings: SettingsController(
           persist: false,
           initial: const UserSettings(
-            name: 'Ben',
             daemonUrl: 'http://127.0.0.1:8080',
             pubkey: taker,
           ),
@@ -151,7 +150,6 @@ void main() {
       final settings = SettingsController(
         persist: false,
         initial: UserSettings(
-          name: 'User',
           daemonUrl: 'http://127.0.0.1:8080',
           pubkey: pubkey,
         ),
@@ -250,7 +248,6 @@ void main() {
           settings: SettingsController(
             persist: false,
             initial: const UserSettings(
-              name: 'Buyer',
               daemonUrl: 'http://127.0.0.1:8080',
               pubkey: taker,
             ),
@@ -318,7 +315,6 @@ void main() {
           settings: SettingsController(
             persist: false,
             initial: const UserSettings(
-              name: 'Seller',
               daemonUrl: 'http://127.0.0.1:8080',
               pubkey: lister,
               operatorTools: true,
@@ -367,7 +363,6 @@ void main() {
           settings: SettingsController(
             persist: false,
             initial: const UserSettings(
-              name: 'Seller',
               daemonUrl: 'http://127.0.0.1:8080',
               pubkey: lister,
               operatorTools: true,
@@ -416,7 +411,6 @@ void main() {
         settings: SettingsController(
           persist: false,
           initial: const UserSettings(
-            name: 'Ada',
             daemonUrl: 'http://127.0.0.1:8080',
             pubkey: lister,
           ),

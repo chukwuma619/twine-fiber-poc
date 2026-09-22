@@ -169,11 +169,11 @@ flutter run -d DEVICE_B \
 
 On an Android emulator, set `TWINE_FIBER_RPC` to `http://10.0.2.2:8227` (User A) or `http://10.0.2.2:8247` (User B). The daemon URL is already `http://10.0.2.2:8080` unless you override `TWINE_DAEMON_URL`.
 
-Without dart-defines, open **Settings** on each phone, set that user’s RPC and P2P from the table, then **Read node info**.
+Without dart-defines, open **Settings** on each phone, set that user’s RPC and P2P from the table, then **Read this phone**.
 
 ## Walk it in the app
 
-Settings stores this user’s `fnn` RPC, P2P address, and the Twine daemon URL. **Read node info** treats the Fiber pubkey as the user id.
+Settings stores this phone’s `fnn` RPC, P2P address, and the Twine daemon URL. **Read this phone** loads the Fiber pubkey — that is the user id. There is no display name.
 
 | Screen | Actions |
 | --- | --- |
@@ -277,7 +277,7 @@ App launch (`--dart-define`, compile-time; used when SharedPreferences has no va
 | --- | --- | --- |
 | `TWINE_FIBER_RPC` | `http://127.0.0.1:8227` | this phone’s `fnn` |
 | `TWINE_P2P` | `/ip4/127.0.0.1/tcp/8228` | this phone’s P2P address |
-| `TWINE_PUBKEY` | unset | Fiber pubkey (user id). Empty until **Read node info** if omitted |
+| `TWINE_PUBKEY` | unset | Fiber pubkey (user id). Empty until **Read this phone** if omitted |
 | `TWINE_DAEMON_URL` | `http://127.0.0.1:8080` (iOS / desktop) | Twine daemon. Android emulator default is `http://10.0.2.2:8080` |
 
 P2P ports are User A `8228`, Twine `8238`, User B `8248`.

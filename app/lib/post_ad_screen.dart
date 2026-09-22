@@ -27,11 +27,17 @@ class _PostAdScreenState extends State<PostAdScreen> {
   final TextEditingController _min = TextEditingController();
   final TextEditingController _max = TextEditingController();
   final TextEditingController _method = TextEditingController(text: 'Opay');
-  var _currency = fiatCurrencies.first;
+  late FiatCurrency _currency;
   String? _error;
   var _busy = false;
 
   UserSettings get _user => widget.settings.settings;
+
+  @override
+  void initState() {
+    super.initState();
+    _currency = fiatByCode(_user.preferredCurrency);
+  }
 
   Future<void> _submit() async {
     setState(() {

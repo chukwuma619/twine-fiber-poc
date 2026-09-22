@@ -32,3 +32,13 @@ const fiatCurrencies = [
   FiatCurrency(code: 'CNY', name: 'Chinese Yuan'),
   FiatCurrency(code: 'JPY', name: 'Japanese Yen'),
 ];
+
+FiatCurrency fiatByCode(String? code) {
+  final want = (code ?? '').trim().toUpperCase();
+  for (final currency in fiatCurrencies) {
+    if (currency.code == want) {
+      return currency;
+    }
+  }
+  return fiatCurrencies.first;
+}

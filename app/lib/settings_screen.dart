@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import 'currencies.dart';
 import 'daemon_api.dart';
 import 'fiber_api.dart';
 import 'models.dart';
@@ -24,7 +26,6 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  late final TextEditingController _name;
   late final TextEditingController _fiberRpc;
   late final TextEditingController _daemonUrl;
   late final TextEditingController _p2p;
@@ -39,31 +40,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _name = TextEditingController(text: _user.name);
     _fiberRpc = TextEditingController(text: _user.fiberRpc);
     _daemonUrl = TextEditingController(text: _user.daemonUrl);
     _p2p = TextEditingController(text: _user.p2pAddress);
+    widget.settings.addListener(_onSettings);
     _refresh();
   }
 
   @override
   void dispose() {
-    _name.dispose();
+    widget.settings.removeListener(_onSettings);
     _fiberRpc.dispose();
     _daemonUrl.dispose();
     _p2p.dispose();
     super.dispose();
   }
 
-  Future<void> _persist({String? pubkey, bool? operatorTools}) {
+  void _onSettings() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _persist({
+    String? pubkey,
+    bool? operatorTools,
+    String? preferredCurrency,
+  }) {
     return widget.settings.update(
       _user.copyWith(
-        name: _name.text,
         fiberRpc: _fiberRpc.text,
         daemonUrl: _daemonUrl.text,
         p2pAddress: _p2p.text,
         pubkey: pubkey,
         operatorTools: operatorTools,
+        preferredCurrency: preferredCurrency,
       ),
     );
   }
@@ -88,7 +99,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() {
         _twine = twine;
         _toTwine = channel;
-        _status = 'Node pubkey $pubkey';
+        _status = 'This phone is ${shortPubkey(pubkey)}';
         _busy = false;
       });
     } catch (err) {
@@ -134,7 +145,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() {
         _twine = twine;
         _toTwine = channel;
-        _status = 'Opened your outbound channel to Twine. You can sell.';
+        _status = 'You can sell. Outbound channel to Twine is ready.';
         _busy = false;
       });
     } catch (err) {
@@ -169,7 +180,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       setState(() {
-        _status = result.message;
+        _status = result.channelOpen
+            ? 'You can receive CKB. Twine opened a return channel.'
+            : result.message;
         _busy = false;
       });
     } catch (err) {
@@ -183,78 +196,189 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _copy(String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Copied')),
+    );
+  }
+
+  String get _channelCopy {
+    final channel = _toTwine;
+    if (channel == null) {
+      return 'No outbound channel to Twine yet. Open one to sell.';
+    }
+    if (channel.open) {
+      return 'Outbound channel to Twine is ready. You can accept and lock a sell.';
+    }
+    return 'Outbound channel to Twine is ${channel.channelId ?? 'pending'}';
+  }
+
   @override
   Widget build(BuildContext context) {
+    final pubkey = _user.pubkey;
+    final preferred = fiatByCode(_user.preferredCurrency);
+
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          TextField(
-            key: const Key('settings-name'),
-            controller: _name,
-            decoration: const InputDecoration(labelText: 'Display name'),
-          ),
-          TextField(
-            key: const Key('settings-fiber-rpc'),
-            controller: _fiberRpc,
-            decoration: const InputDecoration(labelText: 'Your Fiber RPC'),
-            keyboardType: TextInputType.url,
-          ),
-          TextField(
-            key: const Key('settings-p2p'),
-            controller: _p2p,
-            decoration: const InputDecoration(labelText: 'Your Fiber P2P address'),
-          ),
-          TextField(
-            key: const Key('settings-daemon'),
-            controller: _daemonUrl,
-            decoration: const InputDecoration(
-              labelText: 'Twine daemon',
-              helperText:
-                  'iOS simulator: 127.0.0.1. Android emulator: 10.0.2.2',
+          _SectionCard(
+            title: 'You',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (pubkey != null && pubkey.isNotEmpty) ...[
+                  Text(
+                    'Fiber pubkey',
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  SelectableText(
+                    pubkey,
+                    key: const Key('settings-pubkey'),
+                  ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: IconButton(
+                      key: const Key('copy-pubkey'),
+                      onPressed: () => _copy(pubkey),
+                      icon: const Icon(Icons.copy),
+                      tooltip: 'Copy pubkey',
+                    ),
+                  ),
+                ] else
+                  const Text(
+                    'Read this phone’s Fiber node. The pubkey is your id on ads and trades.',
+                  ),
+                FilledButton(
+                  key: const Key('refresh-node'),
+                  onPressed: _busy ? null : _refresh,
+                  child: const Text('Read this phone'),
+                ),
+              ],
             ),
-            keyboardType: TextInputType.url,
           ),
-          SwitchListTile(
-            key: const Key('operator-tools'),
-            title: const Text('Operator tools'),
-            subtitle: const Text('Show award buttons on disputed trades'),
-            value: _user.operatorTools,
-            onChanged: (value) => _persist(operatorTools: value),
-          ),
-          const SizedBox(height: 8),
-          if (_user.pubkey != null) Text('Pubkey: ${_user.pubkey}'),
-          if (_twine?.pubkey != null) Text('Twine: ${_twine!.pubkey}'),
-          if (_toTwine != null)
-            Text(
-              _toTwine!.open
-                  ? 'Outbound channel to Twine is ready'
-                  : 'Outbound channel to Twine is ${_toTwine!.channelId ?? "pending"}',
-              key: const Key('channel-status'),
-            )
-          else
-            const Text(
-              'No outbound channel to Twine yet. Open one to sell.',
-              key: Key('channel-status'),
-            ),
           const SizedBox(height: 12),
-          FilledButton(
-            key: const Key('refresh-node'),
-            onPressed: _busy ? null : _refresh,
-            child: const Text('Read node info'),
+          _SectionCard(
+            title: 'Listing',
+            child: DropdownButtonFormField<FiatCurrency>(
+              key: const Key('settings-currency'),
+              initialValue: preferred,
+              decoration: const InputDecoration(
+                labelText: 'Default currency',
+                helperText: 'Used when you post a sell offer',
+              ),
+              items: [
+                for (final currency in fiatCurrencies)
+                  DropdownMenuItem(
+                    value: currency,
+                    child: Text(currency.label),
+                  ),
+              ],
+              onChanged: _busy
+                  ? null
+                  : (value) {
+                      if (value == null) {
+                        return;
+                      }
+                      _persist(preferredCurrency: value.code);
+                    },
+            ),
           ),
-          const SizedBox(height: 8),
-          FilledButton(
-            key: const Key('open-channel-twine'),
-            onPressed: _busy ? null : _openTowardTwine,
-            child: const Text('Open channel to Twine'),
+          const SizedBox(height: 12),
+          _SectionCard(
+            title: 'Channels',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _channelCopy,
+                  key: const Key('channel-status'),
+                ),
+                if (_twine?.pubkey != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Twine ${shortPubkey(_twine!.pubkey!)}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+                const SizedBox(height: 12),
+                FilledButton(
+                  key: const Key('open-channel-twine'),
+                  onPressed: _busy ? null : _openTowardTwine,
+                  child: const Text('Open channel to sell'),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  key: const Key('ask-twine-channel'),
+                  onPressed: _busy ? null : _askTwineChannel,
+                  child: const Text('Ask Twine for a return channel'),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Sell needs an outbound channel. Buy needs Twine to be able to pay you.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 8),
-          FilledButton(
-            key: const Key('ask-twine-channel'),
-            onPressed: _busy ? null : _askTwineChannel,
-            child: const Text('Ask Twine to open a return channel'),
+          const SizedBox(height: 12),
+          _SectionCard(
+            title: 'Coordinator',
+            child: SwitchListTile(
+              key: const Key('operator-tools'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Dispute tools'),
+              subtitle: const Text(
+                'Show Award buyer and Award seller after someone files a dispute. '
+                'Normal trades release without this.',
+              ),
+              value: _user.operatorTools,
+              onChanged: (value) => _persist(operatorTools: value),
+            ),
+          ),
+          const SizedBox(height: 12),
+          _SectionCard(
+            title: 'This phone',
+            child: Column(
+              children: [
+                TextField(
+                  key: const Key('settings-fiber-rpc'),
+                  controller: _fiberRpc,
+                  decoration: const InputDecoration(
+                    labelText: 'Fiber RPC',
+                    helperText: 'This phone’s fnn',
+                  ),
+                  keyboardType: TextInputType.url,
+                ),
+                TextField(
+                  key: const Key('settings-p2p'),
+                  controller: _p2p,
+                  decoration: const InputDecoration(
+                    labelText: 'Fiber P2P address',
+                  ),
+                ),
+                TextField(
+                  key: const Key('settings-daemon'),
+                  controller: _daemonUrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Twine daemon',
+                    helperText:
+                        'iOS simulator: 127.0.0.1. Android emulator: 10.0.2.2',
+                  ),
+                  keyboardType: TextInputType.url,
+                ),
+              ],
+            ),
           ),
           if (_status != null) ...[
             const SizedBox(height: 12),
@@ -268,4 +392,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
   }
+}
+
+class _SectionCard extends StatelessWidget {
+  const _SectionCard({required this.title, required this.child});
+
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 12),
+            child,
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+String shortPubkey(String pubkey) {
+  final text = pubkey.trim();
+  if (text.length <= 12) {
+    return text;
+  }
+  return '${text.substring(0, 6)}…${text.substring(text.length - 4)}';
 }
