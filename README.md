@@ -15,10 +15,12 @@ Node data, keys, the `fnn` binary, `daemon/order.json`, and `daemon/market.json`
 
 ## What a reviewer can do
 
-1. Open Settings, point the app at a Fiber RPC, and open both channel directions with Twine.
-2. Post a sell ad: CKB amount, currency, price, min–max per take, payment rail and handle.
-3. From a second node, pick that ad, enter how much they pay inside the limit, and start a trade. The daemon creates a hold invoice for that slice only.
-4. Seller locks the hold from their own node. Buyer marks fiat sent and supplies a payout invoice. Seller releases.
+You need **two phones** (two users): two iOS Simulators, two Android emulators, or one of each. One `flutter run` is not enough.
+
+1. Fund and start the three lab nodes, open channels, start the daemon (see [Run it](#run-it)).
+2. Launch the app on two devices, each pointed at a different Fiber RPC (see [Two phones](#two-phones-required-for-a-real-trade)).
+3. User A posts a sell ad. User B takes it from BUY CKB.
+4. A locks the hold. B marks fiat sent. A releases.
 5. Watch one of the four endings on testnet.
 
 ```text
@@ -64,11 +66,12 @@ Leg 2 comes first. The daemon calls `settle_invoice` only after `send_payment` t
 
 ## Requirements
 
-- macOS or Linux (the setup script downloads a Fiber v0.9.1 portable bundle for that host)
+- macOS or Linux
+- Two phones to run the app: two iOS Simulators (Xcode), two Android emulators (Android Studio), or one of each
 - `curl`, `jq`, `python3`, `openssl`
 - [ckb-cli](https://github.com/nervosnetwork/ckb-cli) on `PATH` (used once, to print testnet addresses)
 - Rust (stable) and Cargo
-- Flutter (the app targets Dart 3.11)
+- Flutter (the app targets Dart 3.11). The setup script downloads a Fiber v0.9.1 portable bundle for the host.
 
 ## Run it
 
@@ -98,34 +101,95 @@ The Settings screen can do the same job without the script: **Open channel to Tw
 curl -s http://127.0.0.1:8080/health
 ```
 
-`ready` is true when the Twine node answers. Defaults are `TWINE_RPC=http://127.0.0.1:8237` and `TWINE_P2P=/ip4/127.0.0.1/tcp/8238`. Start the daemon from `daemon/` so the market file is `daemon/market.json`.
+`ready` is true when the Twine node answers. Defaults are `TWINE_RPC=http://127.0.0.1:8237` and `TWINE_P2P=/ip4/127.0.0.1/tcp/8238`. Start the daemon from `daemon/` so the market file is `daemon/market.json`. Then launch **two** phones.
+
+## Two phones (required for a real trade)
+
+One phone is one user: that install talks to one `fnn`, and the Fiber pubkey is their id. The same user can list or take. A trade still needs **two phones**, because Lock/`send_payment` runs on the lister’s node and the payout invoice comes from the taker’s node.
+
+Two iOS Simulators, two Android emulators, or one of each all work. Leave both `flutter run` terminals open. If one quits, that device no longer has a running app (you will not find Twine on the home screen until you launch it again).
+
+The Android emulator reaches the host as `10.0.2.2`, not `127.0.0.1`. P2P stays `127.0.0.1` because Twine (on the host) dials the user `fnn` on the host.
+
+| Phone | Lab node | Fiber RPC (iOS) | Fiber RPC (Android emulator) | P2P |
+| --- | --- | --- | --- | --- |
+| User A | `seller` in the scripts | `http://127.0.0.1:8227` | `http://10.0.2.2:8227` | `/ip4/127.0.0.1/tcp/8228` |
+| User B | `buyer` in the scripts | `http://127.0.0.1:8247` | `http://10.0.2.2:8247` | `/ip4/127.0.0.1/tcp/8248` |
+
+Daemon URL is `http://127.0.0.1:8080` on iOS / desktop, and `http://10.0.2.2:8080` on an Android emulator (the app fills that in). A physical phone on the same network needs `LISTEN=0.0.0.0:8080` and the machine’s LAN address for RPC, P2P, and the daemon.
+
+Those script names are two machines, not roles. Either side can post or take.
+
+1. Boot two devices and confirm both show up:
 
 ```bash
-cd app && flutter run
+# iOS: Xcode → Window → Devices and Simulators, or File → Open Simulator
+# Android: Android Studio Device Manager, or:
+flutter emulators
+flutter emulators --launch EMULATOR_A
+flutter emulators --launch EMULATOR_B
+
+flutter devices
 ```
 
-On the iOS simulator the daemon URL is `http://127.0.0.1:8080`. On the Android emulator use `http://10.0.2.2:8080`. The app fills that in. A phone on the same network needs `LISTEN=0.0.0.0:8080` and the machine’s LAN address.
+Copy each device id (`iPhone 17 Pro` and `iPhone 18 Pro`, or two Android emulators).
 
-Point one app at the seller RPC (`http://127.0.0.1:8227`, P2P `/ip4/127.0.0.1/tcp/8228`) and a second app at the buyer RPC (`http://127.0.0.1:8247`, P2P `/ip4/127.0.0.1/tcp/8248`).
+2. Fetch the two user pubkeys (optional but avoids a Settings tap):
 
 ```bash
-./scripts/stop-nodes.sh
+A_PUB=$(curl -s http://127.0.0.1:8227 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['pubkey'])")
+B_PUB=$(curl -s http://127.0.0.1:8247 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['pubkey'])")
+echo "A=$A_PUB"
+echo "B=$B_PUB"
 ```
 
-That stops the daemon (if `nodes/daemon.pid` exists) and the three nodes.
+3. In one terminal, start User A (replace `DEVICE_A` with the first device id). On Android, use the `10.0.2.2` RPC:
+
+```bash
+cd app
+flutter run -d DEVICE_A \
+  --dart-define=TWINE_FIBER_RPC=http://127.0.0.1:8227 \
+  --dart-define=TWINE_P2P=/ip4/127.0.0.1/tcp/8228 \
+  --dart-define=TWINE_PUBKEY="$A_PUB"
+```
+
+4. In a **second** terminal, start User B. Same idea, port `8247`:
+
+```bash
+cd app
+flutter run -d DEVICE_B \
+  --dart-define=TWINE_FIBER_RPC=http://127.0.0.1:8247 \
+  --dart-define=TWINE_P2P=/ip4/127.0.0.1/tcp/8248 \
+  --dart-define=TWINE_PUBKEY="$B_PUB"
+```
+
+On an Android emulator, set `TWINE_FIBER_RPC` to `http://10.0.2.2:8227` (User A) or `http://10.0.2.2:8247` (User B). The daemon URL is already `http://10.0.2.2:8080` unless you override `TWINE_DAEMON_URL`.
+
+Without dart-defines, open **Settings** on each phone, set that user’s RPC and P2P from the table, then **Read node info**.
 
 ## Walk it in the app
 
-Settings stores the display name, this user’s `fnn` RPC, P2P address, and the Twine daemon URL. **Read node info** treats the Fiber pubkey as the user id. The same node can post an ad or take someone else’s.
+Settings stores this user’s `fnn` RPC, P2P address, and the Twine daemon URL. **Read node info** treats the Fiber pubkey as the user id.
 
 | Screen | Actions |
 | --- | --- |
-| Market | Browse open ads. Tap an offer, pick how much to pay in the limit, start a trade |
-| Post ad | Available, currency, price, min–max, payment rail and handle |
-| Trade | Seller: Lock, Release. Buyer: Fiat sent, Retry. Either side: dispute and chat |
+| Market | BUY CKB is other people’s ads. SELL CKB is yours (badge **YOUR OFFER**). Tap + to post. Tap someone else’s offer to take |
+| Post ad | Available (CKB), currency, price (that currency per CKB, shown as `50 NGN/CKB`), min–max per take, payment rail and handle |
+| Trade | Lister: Lock, Release. Taker: Fiat sent, Retry. Either side: dispute and chat |
 | Settings | Channel status. Open channel to Twine. Ask Twine for a return channel. Operator tools toggle |
 
-**Path A.** Buyer node stays up. Seller posts 2 CKB at 2000 NGN, limit 2000–4000 NGN. Buyer takes 2000 NGN (hold is 1 CKB). Seller presses Lock, buyer pays fiat outside and presses Fiat sent, seller presses Release. Leftover 1 CKB stays listed if it still meets the minimum. The log lists the buyer payment, then settle, then `Settled`. The invoice shows `Paid`.
+**Path A (two phones).**
+
+1. On User A, open **SELL CKB** → **+**. Post an offer, e.g. available 2 CKB, currency `NGN`, price `2000` (2000 NGN/CKB), min `2000`, max `4000`, payment `Opay`.
+2. On User A, BUY CKB stays empty (that ad is theirs). On **SELL CKB** it shows **YOUR OFFER**.
+3. On User B, **BUY CKB** shows the same card without YOUR OFFER. Tap it, pay an amount inside the limit (e.g. `2000` NGN → 1 CKB hold), **Start trade**.
+4. On User A, **My trades** → the trade → **Lock** (`send_payment` on A’s `fnn`).
+5. On User B, pay fiat outside the app, then **Fiat sent** (B’s `fnn` creates the payout invoice).
+6. On User A, **Release**. The daemon pays B, then `settle_invoice`. State `Settled`, invoice `Paid`. Leftover 1 CKB stays listed if it still meets the minimum.
 
 **Path B.** After Fiat sent, disconnect the buyer on the Fiber graph so Twine cannot route, then Release. State becomes `Leg2Failed`. The hold stays `Received`. The log has no `settle_invoice`. Reconnect the buyer and press Retry with new invoice. That retry is path A.
 
@@ -149,6 +213,14 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 A seller-wins trade stays open on that ad, so a second take is blocked until the hold expires.
 
 **Path D.** Lock a hold and do not settle it. Leave the daemon running. After 16 hours `get_invoice` is `Expired`, the trade state is `Expired`, the reserved CKB returns to the ad, and the log records a failed `settle_invoice` for that payment hash.
+
+When you are done:
+
+```bash
+./scripts/stop-nodes.sh
+```
+
+That stops the daemon (if `nodes/daemon.pid` exists) and the three nodes. Quit each `flutter run` with `q`.
 
 ## HTTP API
 
@@ -197,7 +269,16 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 | `TWINE_RELEASE_PAUSE_MS` | unset | pause before the buyer `send_payment` |
 | `FUNDING_SHANNONS` | `50000000000` (500 CKB) | channel funding in `open-channels.sh` and `POST /connect` |
 
-P2P ports are seller `8228`, Twine `8238`, buyer `8248`.
+App launch (`--dart-define`, compile-time; used when SharedPreferences has no value yet):
+
+| Define | Default | |
+| --- | --- | --- |
+| `TWINE_FIBER_RPC` | `http://127.0.0.1:8227` | this phone’s `fnn` |
+| `TWINE_P2P` | `/ip4/127.0.0.1/tcp/8228` | this phone’s P2P address |
+| `TWINE_PUBKEY` | unset | Fiber pubkey (user id). Empty until **Read node info** if omitted |
+| `TWINE_DAEMON_URL` | `http://127.0.0.1:8080` (iOS / desktop) | Twine daemon. Android emulator default is `http://10.0.2.2:8080` |
+
+P2P ports are User A `8228`, Twine `8238`, User B `8248`.
 
 ## Out of scope
 

@@ -1,19 +1,35 @@
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+const String _envFiberRpc = String.fromEnvironment(
+  'TWINE_FIBER_RPC',
+  defaultValue: 'http://127.0.0.1:8227',
+);
+const String _envP2p = String.fromEnvironment(
+  'TWINE_P2P',
+  defaultValue: '/ip4/127.0.0.1/tcp/8228',
+);
+const String _envPubkey = String.fromEnvironment('TWINE_PUBKEY');
+const String _envDaemonUrl = String.fromEnvironment('TWINE_DAEMON_URL');
+
 String defaultDaemonUrl() {
+  if (_envDaemonUrl.isNotEmpty) {
+    return _envDaemonUrl;
+  }
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     return 'http://10.0.2.2:8080';
   }
   return 'http://127.0.0.1:8080';
 }
 
+String? defaultPubkey() => _envPubkey.isEmpty ? null : _envPubkey;
+
 class UserSettings {
   const UserSettings({
     this.name = '',
-    this.fiberRpc = 'http://127.0.0.1:8227',
+    this.fiberRpc = _envFiberRpc,
     this.daemonUrl = '',
-    this.p2pAddress = '/ip4/127.0.0.1/tcp/8228',
+    this.p2pAddress = _envP2p,
     this.operatorTools = false,
     this.pubkey,
   });
@@ -47,7 +63,11 @@ class UserSettings {
 
 class SettingsController extends ChangeNotifier {
   SettingsController({UserSettings? initial, this.persist = true})
-    : settings = initial ?? UserSettings(daemonUrl: defaultDaemonUrl());
+    : settings = initial ??
+          UserSettings(
+            daemonUrl: defaultDaemonUrl(),
+            pubkey: defaultPubkey(),
+          );
 
   final bool persist;
   UserSettings settings;
