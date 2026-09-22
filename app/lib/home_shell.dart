@@ -81,9 +81,11 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   void _onSettings() {
-    if (mounted) {
-      _load();
-    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _load();
+      }
+    });
   }
 
   Future<void> _load() => _fetch(showSpinner: true);
@@ -225,7 +227,13 @@ class _HomeShellState extends State<HomeShell> {
           onPressed: _openSettings,
           icon: const Icon(Icons.menu),
         ),
-        title: const Text('Twine'),
+        title: Text(
+          _user.labSeat == null
+              ? 'Twine'
+              : _user.labSeat == 'B'
+              ? 'Twine · User B'
+              : 'Twine · User A',
+        ),
         actions: [
           IconButton(
             key: const Key('refresh-market'),

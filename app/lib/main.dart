@@ -31,7 +31,23 @@ class _TwineAppState extends State<TwineApp> {
   @override
   void initState() {
     super.initState();
-    _settings.load();
+    _start();
+  }
+
+  Future<void> _start() async {
+    await _settings.load();
+    if (!mounted || !_settings.persist) {
+      return;
+    }
+    try {
+      final pubkey = await _fiber.nodePubkey(_settings.settings.fiberRpc);
+      if (!mounted || pubkey == _settings.settings.pubkey) {
+        return;
+      }
+      await _settings.update(_settings.settings.copyWith(pubkey: pubkey));
+    } catch (_) {
+      // Settings still lets them tap Read this phone if the node is down.
+    }
   }
 
   @override

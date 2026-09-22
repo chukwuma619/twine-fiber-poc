@@ -109,6 +109,8 @@ One phone is one user: that install talks to one `fnn`, and the Fiber pubkey is 
 
 Two iOS Simulators, two Android emulators, or one of each all work. Leave both `flutter run` terminals open. If one quits, that device no longer has a running app (you will not find Twine on the home screen until you launch it again).
 
+Plain `flutter run` (no dart-defines) still gives two users: **iPhone 17 Pro** is User A (`8227`), **iPhone 18 Pro** is User B (`8247`). The title bar shows `Twine · User A` or `Twine · User B`. Each install then reads that node’s pubkey. Dart-defines still override this.
+
 The Android emulator reaches the host as `10.0.2.2`, not `127.0.0.1`. P2P stays `127.0.0.1` because Twine (on the host) dials the user `fnn` on the host.
 
 | Phone | Lab node | Fiber RPC (iOS) | Fiber RPC (Android emulator) | P2P |
@@ -169,7 +171,7 @@ flutter run -d DEVICE_B \
 
 On an Android emulator, set `TWINE_FIBER_RPC` to `http://10.0.2.2:8227` (User A) or `http://10.0.2.2:8247` (User B). The daemon URL is already `http://10.0.2.2:8080` unless you override `TWINE_DAEMON_URL`.
 
-Without dart-defines, open **Settings** on each phone, set that user’s RPC and P2P from the table, then **Read this phone**.
+Without dart-defines, iPhone 17 Pro / User A and iPhone 18 Pro / User B are assigned automatically. For any other device pair, pass the dart-defines above or set Fiber RPC / P2P in **Settings** and tap **Read this phone**.
 
 ## Walk it in the app
 

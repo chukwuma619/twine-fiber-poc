@@ -212,6 +212,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if (_user.labSeat != null) ...[
+                  Text(
+                    labUserFromSeat(_user.labSeat!).label,
+                    key: const Key('lab-user'),
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 8),
+                ],
                 if (pubkey != null && pubkey.isNotEmpty) ...[
                   Text(
                     'Fiber pubkey',
