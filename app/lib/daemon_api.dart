@@ -154,6 +154,18 @@ class DaemonApi {
     return _trade(baseUrl, '/trades/$id/chat', {'from': from, 'text': text});
   }
 
+  Future<TradeSnapshot> awardBuyer(
+    String baseUrl,
+    String id, {
+    required String invoice,
+  }) {
+    return _trade(baseUrl, '/trades/$id/award_buyer', {'invoice': invoice});
+  }
+
+  Future<TradeSnapshot> awardSeller(String baseUrl, String id) {
+    return _trade(baseUrl, '/trades/$id/award_seller');
+  }
+
   Future<TwineInfo> fetchTwine(String baseUrl) async {
     return TwineInfo.fromJson(_asMap(await _getJson(baseUrl, '/twine')));
   }

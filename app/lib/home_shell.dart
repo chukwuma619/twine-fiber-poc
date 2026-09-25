@@ -9,12 +9,13 @@ import 'offer_card.dart';
 import 'post_ad_screen.dart';
 import 'settings.dart';
 import 'settings_screen.dart';
+import 'solver_desk.dart';
 import 'take_ad_dialog.dart';
 import 'trade_screen.dart';
 
 enum BookSide { buy, sell }
 
-enum HomeTab { book, trades }
+enum HomeTab { book, trades, disputes }
 
 class HomeShell extends StatefulWidget {
   const HomeShell({
@@ -253,9 +254,14 @@ class _HomeShellState extends State<HomeShell> {
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
               child: Text(_error!, key: const Key('error-message')),
             ),
-          Expanded(
-            child: _tab == HomeTab.book ? _bookBody() : _tradesBody(),
-          ),
+          Expanded(child: switch (_tab) {
+            HomeTab.book => _bookBody(),
+            HomeTab.trades => _tradesBody(),
+            HomeTab.disputes => SolverDesk(
+              settings: widget.settings,
+              daemon: widget.daemon,
+            ),
+          }),
         ],
       ),
       floatingActionButton: _tab == HomeTab.book
@@ -266,10 +272,18 @@ class _HomeShellState extends State<HomeShell> {
             )
           : null,
       bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab == HomeTab.book ? 0 : 1,
+        selectedIndex: switch (_tab) {
+          HomeTab.book => 0,
+          HomeTab.trades => 1,
+          HomeTab.disputes => 2,
+        },
         onDestinationSelected: (index) {
           setState(() {
-            _tab = index == 0 ? HomeTab.book : HomeTab.trades;
+            _tab = switch (index) {
+              0 => HomeTab.book,
+              1 => HomeTab.trades,
+              _ => HomeTab.disputes,
+            };
           });
         },
         destinations: [
@@ -290,6 +304,12 @@ class _HomeShellState extends State<HomeShell> {
               child: const Icon(Icons.swap_horiz),
             ),
             label: 'My trades',
+          ),
+          const NavigationDestination(
+            key: Key('disputes-tab'),
+            icon: Icon(Icons.gavel_outlined),
+            selectedIcon: Icon(Icons.gavel),
+            label: 'Disputes',
           ),
         ],
       ),

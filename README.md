@@ -2,9 +2,9 @@
 
 Twine is a testnet proof of concept for a peer-to-peer CKB market settled on [Fiber](https://github.com/nervosnetwork/fiber). A person posts an offer priced in ordinary money (naira, dollars, and the rest). Another person takes a slice of that offer, pays that money outside the app, and receives CKB on Fiber. The CKB is locked in a hold invoice for the whole fiat window, then released, or returned when the hold expires.
 
-One Flutter app is the trader client. One Rust daemon is the coordinator. Fiber nodes move real testnet CKB (`Fibt`). The app never holds a Fiber key.
+One Flutter app is the trader client and the host solver desk. One Rust daemon is the coordinator. Fiber nodes move real testnet CKB (`Fibt`). The app never holds a Fiber key.
 
-This repository is the lab that proves that loop on testnet. It is a finished proof of concept, and it is the whole product surface that exists today: market, order room, channels, and a host-side solver for disputes.
+This repository is the lab that proves that loop on testnet. It is a finished proof of concept, and it is the whole product surface that exists today: market, order room, channels, and a Disputes tab for the host solver.
 
 ## What it shows
 
@@ -38,10 +38,10 @@ This repository is the lab that proves that loop on testnet. It is a finished pr
 
 | Piece | Role |
 | --- | --- |
-| `app/` | Flutter client. Market, post an offer, order room, settings. Each install talks to one `fnn` and to the daemon. |
+| `app/` | Flutter client. Market, post an offer, order room, settings, and the Disputes desk. Each install talks to one `fnn` and to the daemon. |
 | `daemon/` | Axum HTTP API. Persists ads and trades. The only process that calls the Twine `fnn`. Holds preimage `S`. |
 | `scripts/` | Download `fnn` v0.9.1, start the three lab nodes, open channels, stop them. |
-| Solver | Whoever can reach the daemon on the host. `curl` is the tool. There is no admin screen and no admin key. |
+| Solver | The **Disputes** tab in the same app. There is no admin key. |
 
 The daemon talks only to Twine. Locking a hold (`send_payment`) runs on the lister’s node, from the lister’s app. The payout invoice (`new_invoice`) is created on the taker’s node, from the taker’s app. Twine pays that invoice from its own outbound channel, because the lister’s coins stay locked until `settle_invoice`.
 
@@ -293,6 +293,7 @@ Settings stores this phone’s `fnn` RPC, P2P address, and the Twine daemon URL.
 | Market | **BUY CKB** is other people’s ads. **SELL CKB** is yours (badge **YOUR OFFER**). Tap **+** to post. Tap someone else’s offer to take. A lister with a new take sees **New order — accept** even while the ad is hidden. The home shell polls every 5 seconds. |
 | Post ad | Available (CKB), currency, price (that currency per CKB), min–max per take, payment rail and handle |
 | Order | Accept / Pay / Release. Lister: Accept order (Fiber lock), Reject, Release CKB. Taker: pay card, upload receipt, I have paid, Retry. Either side: cancel while the hold is `Open`, chat, File dispute |
+| Disputes | Host solver desk. Pending cases, take, receipt, chat as admin, Pay taker or Refund lister |
 | Settings | Channel status. Open channel to Twine. Ask Twine for a return channel |
 
 ### Path A
@@ -327,7 +328,7 @@ curl -s http://127.0.0.1:8237 -H 'content-type: application/json' \
 
 ### Path C
 
-Either side can chat while the hold is still `Received`. **File dispute** with a reason is the only request for Twine to step in. The app does not award the trade. Award from the host; see [Solver](#solver).
+Either side can chat while the hold is still `Received`. **File dispute** with a reason is the only request for Twine to step in. The order room does not award. Open **Disputes**; see [Solver](#solver).
 
 ### Path D
 
@@ -335,37 +336,15 @@ Lock a hold and leave it. Leave the daemon running. After 16 hours `get_invoice`
 
 ## Solver
 
-Traders use the Flutter app. The operator awards from another tool. This POC has no admin app and no admin key. The tool is HTTP against the daemon on the host. Anyone who can reach `:8080` can award. That is acceptable on localhost. It is not acceptable if the daemon is reachable from the network.
+Traders and the host solver use the same Flutter app. The **Disputes** tab lists pending cases, lets you take one, read chat and the receipt, then **Pay taker** or **Refund lister**.
+
+It is only that desk. No solver keys, admin DMs, or bonds. Take is local to that install. There is no admin key. Anyone who can reach `:8080` can award. That is acceptable on localhost. It is not acceptable if the daemon is reachable from the network.
 
 1. In the app, either side files a dispute. State becomes `Disputed`. Funds stay locked (`Received`).
-2. On the host, read the trade: chat, `dispute_reason`, and the receipt.
-3. Award the taker or award the lister.
+2. Open **Disputes**. Pending lists those trades. **Take** opens the case.
+3. Look at the receipt and chat. Award from the case screen.
 
-```bash
-TRADE_ID=t1   # from the order screen, or GET /trades?pubkey=
-
-curl -s "http://127.0.0.1:8080/trades/$TRADE_ID"
-curl -s "http://127.0.0.1:8080/trades/$TRADE_ID/proof" -o /tmp/receipt.bin
-```
-
-**Taker wins** pays the stored taker invoice, then `settle_invoice` (path A). If that payment fails, the order stays `Disputed`.
-
-```bash
-INVOICE=$(curl -s "http://127.0.0.1:8080/trades/$TRADE_ID" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['buyer_invoice'])")
-
-curl -s -X POST "http://127.0.0.1:8080/trades/$TRADE_ID/award_buyer" \
-  -H 'content-type: application/json' \
-  -d "{\"invoice\":\"$INVOICE\"}"
-```
-
-**Lister wins** does not settle and does not cancel. The log says the lister is refunded when the TLC expires (path D).
-
-```bash
-curl -s -X POST "http://127.0.0.1:8080/trades/$TRADE_ID/award_seller"
-```
-
-After the hold is `Expired`, both awards fail.
+**Pay taker** pays the stored taker invoice, then `settle_invoice` (path A). If that payment fails, the order stays `Disputed`. **Refund lister** does not settle. The hold stays `Received` until TLC expiry (path D). After the hold is `Expired`, both awards fail.
 
 ## HTTP API
 
@@ -391,11 +370,11 @@ The daemon is the only process that talks to the Twine `fnn`. User nodes are cal
 | `POST` | `/trades/:id/release` | Path A, or `Leg2Failed` if the taker payment fails |
 | `POST` | `/trades/:id/retry` | `{"invoice":"…"}` path A again, from `Leg2Failed` |
 | `POST` | `/trades/:id/dispute` | `{"from":"lister"\|"taker","reason":"…"}` |
-| `POST` | `/trades/:id/chat` | `{"from":"lister","text":"…"}` or `"from":"taker"` on an open trade |
+| `POST` | `/trades/:id/chat` | `{"from":"lister"\|"taker"\|"admin","text":"…"}` on an open trade |
 | `POST` | `/trades/:id/award_buyer` | Solver. `{"invoice":"…"}`. Path A. A failed pay leaves `Disputed` |
 | `POST` | `/trades/:id/award_seller` | Solver. Hold stays `Received` until expiry |
 
-`from` accepts `lister` or `seller`, and `taker` or `buyer`. Stored values are `lister` and `taker`.
+`from` accepts `lister` or `seller`, and `taker` or `buyer`. Chat also accepts `admin` or `solver`. Stored values are `lister`, `taker`, and `admin`.
 
 Errors are `{"error":"…"}` with 400 (bad amount or state), 404 (unknown ad or trade), 409 (an ad already has an open trade), or 502 (Fiber).
 
@@ -429,8 +408,8 @@ cd daemon && cargo test
 cd app && flutter test
 ```
 
-The daemon tests drive the order state machine, including lock, fiat, path B, dispute, windows, and expiry, against a stand-in for Fiber. The Flutter tests cover amounts, the market screen, and lab-user assignment.
+The daemon tests drive the order state machine, including lock, fiat, path B, dispute, windows, and expiry, against a stand-in for Fiber. The Flutter tests cover amounts, the market screen, the solver desk, and lab-user assignment.
 
 ## Out of scope
 
-Nostr, encrypted DMs, key rotation, bonds, fees, UDT, accounts, buy-side ads, rate oracles, partial fills, and app-store builds. Chat is plain text on the daemon. Payment screenshots live in `daemon/proofs/`. The award routes are unauthenticated. Fiber’s shortest hold is 16 hours, so path D is a real wait, not a shortened lab clock.
+Nostr, encrypted DMs, key rotation, bonds, fees, UDT, accounts, buy-side ads, rate oracles, partial fills, and app-store builds. Chat is plain text on the daemon. Payment screenshots live in `daemon/proofs/`. The award routes are unauthenticated. The Disputes tab is a host tool, not an account. Fiber’s shortest hold is 16 hours, so path D is a real wait, not a shortened lab clock.

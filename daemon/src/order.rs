@@ -275,6 +275,16 @@ pub fn party_from(raw: &str) -> Result<String, OrderError> {
     }
 }
 
+/// Chat accepts the two trade parties plus the host solver.
+pub fn chat_party(raw: &str) -> Result<String, OrderError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "admin" | "solver" => Ok("admin".into()),
+        _ => party_from(raw).map_err(|_| {
+            OrderError::BadState("from must be lister, taker, or admin".into())
+        }),
+    }
+}
+
 pub fn allows_chat(state: OrderState) -> bool {
     matches!(
         state,
@@ -908,6 +918,15 @@ mod tests {
         assert!(decode_payment_proof("", "image/jpeg").is_err());
         assert!(decode_payment_proof(&jpeg_b64, "image/png").is_err());
         assert!(decode_payment_proof("@@@", "image/jpeg").is_err());
+    }
+
+    #[test]
+    fn chat_party_accepts_admin_and_trade_sides() {
+        assert_eq!(chat_party("admin").as_deref(), Ok("admin"));
+        assert_eq!(chat_party("solver").as_deref(), Ok("admin"));
+        assert_eq!(chat_party("buyer").as_deref(), Ok("taker"));
+        assert!(chat_party("nobody").is_err());
+        assert!(party_from("admin").is_err());
     }
 
     #[test]

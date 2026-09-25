@@ -11,7 +11,7 @@ use crate::order::{
     add_ckb, allows_chat, allows_dispute, attempt_settle_after_expiry, cancel_hold_invoice,
     ckb_from_fiat, cmp_ckb, create_hold_invoice, deadline_from_now, deadline_passed,
     decode_payment_proof, demo_cancel_invoice, fetch_invoice_status, fiat_from_ckb, new_id,
-    normalize_amount, normalize_pubkey, party_from, payment_hash_of, poll_invoice_paid,
+    chat_party, normalize_amount, normalize_pubkey, party_from, payment_hash_of, poll_invoice_paid,
     poll_invoice_received, poll_payment_done, require_received_for_award,
     require_received_for_dispute, send_payment_to_invoice, settle_hold, timestamp,
     BuyerInvoiceBody, CancelTradeBody, CreateAdBody, CreateTradeBody, FiatSentBody,
@@ -816,7 +816,7 @@ impl MarketStore {
     }
 
     pub fn post_chat(&self, id: &str, body: &PostChatBody) -> Result<TradeView, OrderError> {
-        let from = party_from(&body.from)?;
+        let from = chat_party(&body.from)?;
         let text = body.text.trim();
         if text.is_empty() {
             return Err(OrderError::BadState("chat text is required".into()));
